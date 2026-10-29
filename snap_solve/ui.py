@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPoint, QRect, Qt, QThread, Signal
+import time
+
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPoint, QRect, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
@@ -12,7 +14,8 @@ from PySide6.QtWidgets import (
 
 from . import __version__
 from .config import get_api_key, save_api_key, setting
-from .deepseek import DeepSeekError, solve, transcribe
+from .deepseek import DeepSeekError, StreamCancelled, solve_stream, transcribe_stream
+from .monitor import POLL_MILLISECONDS, STABLE_SECONDS, has_meaningful_change, image_signature
 
 
 STYLE = """
@@ -130,6 +133,25 @@ class CaptureOverlay(QWidget):
             super().keyPressEvent(event)
 
 
+class RegionFrame(QWidget):
+    """A non-interactive outline outside the selected capture area."""
+
+    def __init__(self, screen, region: QRect):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint |
+                         Qt.WindowType.Tool | Qt.WindowType.WindowTransparentForInput)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        geometry = screen.geometry()
+        self.setGeometry(geometry.x() + region.x() - 5, geometry.y() + region.y() - 5,
+                         region.width() + 10, region.height() + 10)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(QColor("#246aee"), 2))
+        painter.drawRoundedRect(self.rect().adjusted(1, 1, -2, -2), 7, 7)
+
+
 class ApiKeyDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -186,19 +208,50 @@ class RecognitionThread(QThread):
         self.api_key = api_key
         self.image = image
         self.solve_enabled = solve_enabled
+        self.cancel_requested = False
 
     def run(self):
         try:
-            self.stage.emit("正在识别并转写题目…")
-            markdown = transcribe(self.api_key, self.image)
+            self.stage.emit("正在流式转写题目…")
+            last_question_emit = 0.0
+
+            def question_update(text: str):
+                nonlocal last_question_emit
+                now = time.monotonic()
+                if not self.cancel_requested and now - last_question_emit >= 0.08:
+                    self.recognized.emit(text)
+                    last_question_emit = now
+
+            markdown = transcribe_stream(self.api_key, self.image,
+                                         question_update,
+                                         cancelled=lambda: self.cancel_requested)
+            if self.cancel_requested:
+                return
             self.recognized.emit(markdown)
             if self.solve_enabled:
-                self.stage.emit("正在生成题解…")
-                self.solved.emit(solve(self.api_key, markdown, self.image))
+                self.stage.emit("题目已转写 · 正在仔细解题…")
+                last_solution_emit = 0.0
+
+                def solution_update(text: str):
+                    nonlocal last_solution_emit
+                    now = time.monotonic()
+                    if not self.cancel_requested and now - last_solution_emit >= 0.08:
+                        self.solved.emit(text)
+                        last_solution_emit = now
+
+                solution = solve_stream(self.api_key, markdown, self.image,
+                                        solution_update,
+                                        cancelled=lambda: self.cancel_requested)
+                if not self.cancel_requested:
+                    self.solved.emit(solution)
+        except StreamCancelled:
+            pass
         except DeepSeekError as exc:
-            self.failed.emit(str(exc))
+            if not self.cancel_requested:
+                self.failed.emit(str(exc))
         except Exception as exc:
-            self.failed.emit(f"处理失败：{exc}")
+            if not self.cancel_requested:
+                self.failed.emit(f"处理失败：{exc}")
 
 
 class MarkdownCard(QFrame):
@@ -216,6 +269,9 @@ class MarkdownCard(QFrame):
         self.copy_button = QPushButton("复制 Markdown")
         self.copy_button.setObjectName("quiet")
         self.copy_button.clicked.connect(self.copy)
+        self.copy_reset_timer = QTimer(self)
+        self.copy_reset_timer.setSingleShot(True)
+        self.copy_reset_timer.timeout.connect(lambda: self.copy_button.setText("复制 Markdown"))
         top.addWidget(self.copy_button)
         layout.addLayout(top)
         self.editor = QPlainTextEdit()
@@ -227,8 +283,7 @@ class MarkdownCard(QFrame):
     def copy(self):
         QApplication.clipboard().setText(self.editor.toPlainText())
         self.copy_button.setText("已复制")
-        from PySide6.QtCore import QTimer
-        QTimer.singleShot(1800, lambda: self.copy_button.setText("复制 Markdown"))
+        self.copy_reset_timer.start(1800)
 
 
 class MainWindow(QMainWindow):
@@ -241,8 +296,18 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLE)
         self.overlays: list[CaptureOverlay] = []
         self.worker: RecognitionThread | None = None
-        self.image_bytes: bytes | None = None
         self.preview_pixmap: QPixmap | None = None
+        self.region_screen = None
+        self.region_rect: QRect | None = None
+        self.region_frame: RegionFrame | None = None
+        self.last_signature: bytes | None = None
+        self.processed_signature: bytes | None = None
+        self.last_changed_at = 0.0
+        self.candidate_pixmap: QPixmap | None = None
+        self.generation = 0
+        self.monitor_timer = QTimer(self)
+        self.monitor_timer.setInterval(POLL_MILLISECONDS)
+        self.monitor_timer.timeout.connect(self.poll_region)
 
         root = QWidget()
         self.setCentralWidget(root)
@@ -286,11 +351,15 @@ class MainWindow(QMainWindow):
         self.capture_button.setObjectName("primary")
         self.capture_button.clicked.connect(self.start_capture)
         action_row.addWidget(self.capture_button)
+        self.monitor_toggle = QCheckBox("持续监测")
+        self.monitor_toggle.setChecked(True)
+        self.monitor_toggle.toggled.connect(self.on_monitor_toggled)
+        action_row.addWidget(self.monitor_toggle)
         self.solve_toggle = QCheckBox("同时解题")
-        self.solve_toggle.setChecked(True)
+        self.solve_toggle.toggled.connect(self.on_solve_toggled)
         action_row.addWidget(self.solve_toggle)
         action_row.addStretch()
-        hint = QLabel("拖动框选题目，自动转写为 Markdown")
+        hint = QLabel("区域稳定约 1.5 秒后自动更新")
         hint.setObjectName("muted")
         action_row.addWidget(hint)
         body.addLayout(action_row)
@@ -304,10 +373,10 @@ class MainWindow(QMainWindow):
         left_layout = QVBoxLayout(left)
         left_layout.setContentsMargins(19, 18, 19, 18)
         left_layout.setSpacing(14)
-        left_title = QLabel("截图预览")
+        left_title = QLabel("区域预览")
         left_title.setObjectName("section")
         left_layout.addWidget(left_title)
-        self.preview = QLabel("尚未选择截图\n\n点击上方按钮开始")
+        self.preview = QLabel("尚未选择监测区域\n\n点击上方按钮开始")
         self.preview.setObjectName("preview")
         self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview.setMinimumHeight(220)
@@ -325,9 +394,10 @@ class MainWindow(QMainWindow):
         self.solution_card = MarkdownCard("题解 · Markdown 源码", "勾选「同时解题」后，题解会显示在这里。")
         right.addWidget(self.question_card, 1)
         right.addWidget(self.solution_card, 1)
+        self.solution_card.hide()
         columns.addLayout(right, 7)
         body.addLayout(columns, 1)
-        self.status = QLabel("准备就绪  ·  Ctrl+Shift+A 快速截图")
+        self.status = QLabel("准备就绪  ·  Ctrl+Shift+A 选择区域")
         self.status.setObjectName("muted")
         body.addWidget(self.status)
         outer.addWidget(content, 1)
@@ -338,13 +408,13 @@ class MainWindow(QMainWindow):
         ApiKeyDialog(self).exec()
 
     def start_capture(self):
-        if self.worker and self.worker.isRunning():
-            return
         if not get_api_key():
             if ApiKeyDialog(self).exec() != QDialog.DialogCode.Accepted:
                 return
+        self.monitor_timer.stop()
+        if self.region_frame:
+            self.region_frame.hide()
         self.hide()
-        from PySide6.QtCore import QTimer
         QTimer.singleShot(250, self.show_overlays)
 
     def show_overlays(self):
@@ -370,43 +440,203 @@ class MainWindow(QMainWindow):
 
     def cancel_capture(self):
         self.dismiss_overlays()
-        self.status.setText("已取消截图")
+        if self.region_rect and self.monitor_toggle.isChecked():
+            self.monitor_timer.start()
+            if self.region_frame:
+                self.region_frame.show()
+            self.status.setText("已取消重新选区，继续监测原区域")
+        else:
+            self.status.setText("已取消选择区域")
 
     def capture_selected(self, pixmap: QPixmap):
+        overlay = self.sender()
+        screen = overlay.screen if isinstance(overlay, CaptureOverlay) else None
+        region = overlay.selection_rect() if isinstance(overlay, CaptureOverlay) else QRect()
         self.dismiss_overlays()
-        if pixmap.isNull():
+        if pixmap.isNull() or screen is None or region.isEmpty():
             self.status.setText("截图失败，请重试")
             return
+        if self.region_frame:
+            self.region_frame.close()
+            self.region_frame.deleteLater()
+        self.region_screen = screen
+        self.region_rect = region
+        self.region_frame = RegionFrame(screen, region)
+        self.move_away_from_region()
+        self.preview_pixmap = pixmap
+        self.candidate_pixmap = pixmap
+        self.last_signature = image_signature(pixmap)
+        self.processed_signature = None
+        self.last_changed_at = time.monotonic()
+        self.generation += 1
+        if self.worker:
+            self.worker.cancel_requested = True
+        self.update_preview()
+        self.question_card.editor.clear()
+        self.solution_card.editor.clear()
+        if self.monitor_toggle.isChecked():
+            self.region_frame.show()
+            self.monitor_timer.start()
+            self.status.setText("监测中 · 等待画面稳定…")
+        else:
+            self.status.setText("区域已设定 · 打开「持续监测」后开始识别")
+
+    def move_away_from_region(self):
+        """Keep the app itself out of the monitored pixels when space permits."""
+        if self.region_screen is None or self.region_rect is None:
+            return
+        screen_geometry = self.region_screen.geometry()
+        target = self.region_rect.translated(screen_geometry.topLeft())
+        window = self.frameGeometry()
+        if not window.intersects(target):
+            return
+        candidates = []
+        for screen in QApplication.screens():
+            available = screen.availableGeometry()
+            width, height = window.width(), window.height()
+            positions = [
+                QPoint(available.left(), available.top()),
+                QPoint(available.right() - width + 1, available.top()),
+                QPoint(available.left(), available.bottom() - height + 1),
+                QPoint(available.right() - width + 1, available.bottom() - height + 1),
+                QPoint(target.right() + 16, target.top()),
+                QPoint(target.left() - width - 16, target.top()),
+                QPoint(target.left(), target.bottom() + 16),
+                QPoint(target.left(), target.top() - height - 16),
+            ]
+            for point in positions:
+                x = max(available.left(), min(point.x(), available.right() - width + 1))
+                y = max(available.top(), min(point.y(), available.bottom() - height + 1))
+                candidate = QRect(x, y, width, height)
+                overlap = candidate.intersected(target)
+                overlap_area = overlap.width() * overlap.height()
+                distance = abs(x - window.x()) + abs(y - window.y())
+                candidates.append((overlap_area, distance, x, y))
+        if candidates:
+            _, _, x, y = min(candidates)
+            self.move(x, y)
+
+    def on_monitor_toggled(self, enabled: bool):
+        self.generation += 1
+        if self.worker:
+            self.worker.cancel_requested = True
+        if not enabled:
+            self.monitor_timer.stop()
+            if self.region_frame:
+                self.region_frame.hide()
+            self.status.setText("监测已暂停，区域仍保留")
+            return
+        if not self.region_rect:
+            self.status.setText("监测已开启 · 请先选择屏幕区域")
+            return
+        self.processed_signature = None
+        self.last_changed_at = time.monotonic()
+        if self.region_frame:
+            self.region_frame.show()
+        self.monitor_timer.start()
+        self.status.setText("监测中 · 等待画面稳定…")
+
+    def on_solve_toggled(self, enabled: bool):
+        self.solution_card.setVisible(enabled)
+        self.solution_card.editor.clear()
+        self.generation += 1
+        if self.worker:
+            self.worker.cancel_requested = True
+        self.processed_signature = None
+        self.last_changed_at = time.monotonic()
+        if self.region_rect and self.monitor_toggle.isChecked():
+            self.status.setText("模式已更新 · 等待画面稳定…")
+
+    def capture_region(self) -> QPixmap:
+        if self.region_screen is None or self.region_rect is None:
+            return QPixmap()
+        if self.region_screen not in QApplication.screens():
+            return QPixmap()
+        rect = self.region_rect
+        return self.region_screen.grabWindow(0, rect.x(), rect.y(), rect.width(), rect.height())
+
+    def poll_region(self):
+        if not self.monitor_toggle.isChecked() or self.region_rect is None:
+            return
+        if (self.region_screen is not None and self.isVisible() and
+                self.frameGeometry().intersects(
+                    self.region_rect.translated(self.region_screen.geometry().topLeft()))):
+            self.status.setText("应用窗口挡住了监测区域，请将窗口移到选区外")
+            return
+        pixmap = self.capture_region()
+        if pixmap.isNull():
+            self.monitor_timer.stop()
+            self.status.setText("无法读取区域，请重新选择屏幕")
+            return
+        signature = image_signature(pixmap)
+        if has_meaningful_change(self.last_signature, signature):
+            self.last_signature = signature
+            self.last_changed_at = time.monotonic()
+            self.candidate_pixmap = pixmap
+            self.preview_pixmap = pixmap
+            self.update_preview()
+            self.generation += 1
+            if self.worker:
+                self.worker.cancel_requested = True
+            self.status.setText("检测到画面变化 · 等待稳定…")
+            return
+        if (time.monotonic() - self.last_changed_at >= STABLE_SECONDS and
+                self.processed_signature != self.last_signature and
+                self.worker is None):
+            if not get_api_key():
+                self.monitor_toggle.setChecked(False)
+                self.status.setText("请先在「API 设置」填写 DeepSeek Key")
+                return
+            self.processed_signature = self.last_signature
+            self.start_recognition(self.candidate_pixmap if self.candidate_pixmap is not None else pixmap)
+
+    def start_recognition(self, pixmap: QPixmap):
+        max_side = max(pixmap.width(), pixmap.height())
+        if max_side > 1800:
+            pixmap = pixmap.scaled(1800, 1800, Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
         output = QByteArray()
         buffer = QBuffer(output)
         buffer.open(QIODevice.OpenModeFlag.WriteOnly)
         pixmap.save(buffer, "PNG")
         buffer.close()
-        self.image_bytes = bytes(output)
-        self.preview_pixmap = pixmap
-        self.update_preview()
-        self.question_card.editor.clear()
-        self.solution_card.editor.clear()
-        self.capture_button.setEnabled(False)
-        self.worker = RecognitionThread(get_api_key(), self.image_bytes, self.solve_toggle.isChecked())
-        self.worker.stage.connect(self.status.setText)
-        self.worker.recognized.connect(self.question_card.editor.setPlainText)
-        self.worker.solved.connect(self.solution_card.editor.setPlainText)
-        self.worker.failed.connect(self.on_error)
-        self.worker.finished.connect(self.on_finished)
-        self.worker.start()
+        generation = self.generation
+        worker = RecognitionThread(get_api_key(), bytes(output), self.solve_toggle.isChecked())
+        self.worker = worker
+        worker.stage.connect(lambda message: self.show_stage(generation, message))
+        worker.recognized.connect(lambda text: self.show_question(generation, text))
+        worker.solved.connect(lambda text: self.show_solution(generation, text))
+        worker.failed.connect(lambda message: self.on_error(generation, message))
+        worker.finished.connect(lambda: self.on_finished(generation, worker))
+        worker.start()
 
-    def on_error(self, message: str):
-        self.status.setText(message)
-        QMessageBox.warning(self, "处理失败", message)
+    def is_current(self, generation: int) -> bool:
+        return generation == self.generation and self.monitor_toggle.isChecked()
 
-    def on_finished(self):
-        self.capture_button.setEnabled(True)
-        if self.status.text().startswith("正在"):
-            self.status.setText("处理完成  ·  可编辑或复制 Markdown 源码")
-        if self.worker:
-            self.worker.deleteLater()
+    def show_stage(self, generation: int, message: str):
+        if self.is_current(generation):
+            self.status.setText(message)
+
+    def show_question(self, generation: int, text: str):
+        if self.is_current(generation):
+            self.question_card.editor.setPlainText(text)
+
+    def show_solution(self, generation: int, text: str):
+        if self.is_current(generation) and self.solve_toggle.isChecked():
+            self.solution_card.editor.setPlainText(text)
+
+    def on_error(self, generation: int, message: str):
+        if self.is_current(generation):
+            self.status.setText(message + " · 画面变化或重新开启监测后可重试")
+
+    def on_finished(self, generation: int, worker: RecognitionThread):
+        if self.is_current(generation) and self.status.text().startswith(("正在", "题目已转写")):
+            self.status.setText("监测中 · 转写完成，等待画面变化")
+        if self.worker is worker:
+            worker.deleteLater()
             self.worker = None
+        if self.monitor_timer.isActive():
+            QTimer.singleShot(0, self.poll_region)
 
     def update_preview(self):
         if self.preview_pixmap:
@@ -423,5 +653,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "正在处理", "请等待本次识别或解题完成后再关闭。")
             event.ignore()
         else:
+            self.monitor_timer.stop()
+            if self.region_frame:
+                self.region_frame.close()
             super().closeEvent(event)
 
