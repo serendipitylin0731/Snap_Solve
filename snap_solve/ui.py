@@ -8,11 +8,12 @@ from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPoint, QRect, Qt, QT
 from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy,
+    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
     QVBoxLayout, QWidget,
 )
 
 from . import __version__
+from .capture import exclude_window_from_capture
 from .config import get_api_key, save_api_key, setting
 from .deepseek import DeepSeekError, StreamCancelled, solve_stream, transcribe_stream
 from .monitor import POLL_MILLISECONDS, STABLE_SECONDS, has_meaningful_change, image_signature
@@ -39,7 +40,6 @@ QCheckBox { spacing: 9px; font-weight: 600; }
 QCheckBox::indicator { width: 17px; height: 17px; }
 QPlainTextEdit, QLineEdit { border: 1px solid #e0e7f1; border-radius: 10px; background: #fbfcff; padding: 12px; selection-background-color: #bcd3ff; }
 QPlainTextEdit:focus, QLineEdit:focus { border-color: #6a9bfa; }
-QLabel#preview { border: 1px dashed #cbd6e7; border-radius: 12px; background: #f8fafd; color: #8d9bb0; }
 """
 
 
@@ -150,6 +150,10 @@ class RegionFrame(QWidget):
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(QPen(QColor("#246aee"), 2))
         painter.drawRoundedRect(self.rect().adjusted(1, 1, -2, -2), 7, 7)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        exclude_window_from_capture(int(self.winId()))
 
 
 class ApiKeyDialog(QDialog):
@@ -296,7 +300,9 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(STYLE)
         self.overlays: list[CaptureOverlay] = []
         self.worker: RecognitionThread | None = None
-        self.preview_pixmap: QPixmap | None = None
+        self.pending_single_pixmap: QPixmap | None = None
+        self.single_shot_active = False
+        self.capture_excluded = False
         self.region_screen = None
         self.region_rect: QRect | None = None
         self.region_frame: RegionFrame | None = None
@@ -359,34 +365,10 @@ class MainWindow(QMainWindow):
         self.solve_toggle.toggled.connect(self.on_solve_toggled)
         action_row.addWidget(self.solve_toggle)
         action_row.addStretch()
-        hint = QLabel("区域稳定约 1.5 秒后自动更新")
+        hint = QLabel("持续监测：稳定后更新  ·  单次模式：选完即读")
         hint.setObjectName("muted")
         action_row.addWidget(hint)
         body.addLayout(action_row)
-
-        columns = QHBoxLayout()
-        columns.setSpacing(18)
-        left = QFrame()
-        left.setObjectName("card")
-        left.setMinimumWidth(265)
-        left.setMaximumWidth(340)
-        left_layout = QVBoxLayout(left)
-        left_layout.setContentsMargins(19, 18, 19, 18)
-        left_layout.setSpacing(14)
-        left_title = QLabel("区域预览")
-        left_title.setObjectName("section")
-        left_layout.addWidget(left_title)
-        self.preview = QLabel("尚未选择监测区域\n\n点击上方按钮开始")
-        self.preview.setObjectName("preview")
-        self.preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.preview.setMinimumHeight(220)
-        self.preview.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        left_layout.addWidget(self.preview)
-        privacy = QLabel("仅将所选区域发送到 DeepSeek API")
-        privacy.setObjectName("muted")
-        privacy.setWordWrap(True)
-        left_layout.addWidget(privacy)
-        columns.addWidget(left, 3)
 
         right = QVBoxLayout()
         right.setSpacing(18)
@@ -395,8 +377,7 @@ class MainWindow(QMainWindow):
         right.addWidget(self.question_card, 1)
         right.addWidget(self.solution_card, 1)
         self.solution_card.hide()
-        columns.addLayout(right, 7)
-        body.addLayout(columns, 1)
+        body.addLayout(right, 1)
         self.status = QLabel("准备就绪  ·  Ctrl+Shift+A 选择区域")
         self.status.setObjectName("muted")
         body.addWidget(self.status)
@@ -459,27 +440,45 @@ class MainWindow(QMainWindow):
         if self.region_frame:
             self.region_frame.close()
             self.region_frame.deleteLater()
-        self.region_screen = screen
-        self.region_rect = region
-        self.region_frame = RegionFrame(screen, region)
-        self.move_away_from_region()
-        self.preview_pixmap = pixmap
+            self.region_frame = None
         self.candidate_pixmap = pixmap
-        self.last_signature = image_signature(pixmap)
-        self.processed_signature = None
-        self.last_changed_at = time.monotonic()
         self.generation += 1
         if self.worker:
             self.worker.cancel_requested = True
-        self.update_preview()
         self.question_card.editor.clear()
         self.solution_card.editor.clear()
         if self.monitor_toggle.isChecked():
+            self.single_shot_active = False
+            self.pending_single_pixmap = None
+            self.region_screen = screen
+            self.region_rect = region
+            self.region_frame = RegionFrame(screen, region)
+            if not self.capture_excluded:
+                self.move_away_from_region()
+            self.last_signature = image_signature(pixmap)
+            self.processed_signature = None
+            self.last_changed_at = time.monotonic()
             self.region_frame.show()
             self.monitor_timer.start()
             self.status.setText("监测中 · 等待画面稳定…")
         else:
-            self.status.setText("区域已设定 · 打开「持续监测」后开始识别")
+            self.region_screen = None
+            self.region_rect = None
+            self.last_signature = None
+            self.processed_signature = None
+            self.single_shot_active = True
+            self.pending_single_pixmap = pixmap
+            self.start_pending_single_shot()
+
+    def start_pending_single_shot(self):
+        if self.pending_single_pixmap is None or self.worker is not None:
+            if self.pending_single_pixmap is not None:
+                self.status.setText("正在结束上一次请求，随后识别新截图…")
+            return
+        pixmap = self.pending_single_pixmap
+        self.pending_single_pixmap = None
+        self.status.setText("单次截图已选取 · 正在转写…")
+        self.start_recognition(pixmap)
 
     def move_away_from_region(self):
         """Keep the app itself out of the monitored pixels when space permits."""
@@ -520,11 +519,13 @@ class MainWindow(QMainWindow):
         self.generation += 1
         if self.worker:
             self.worker.cancel_requested = True
+        self.single_shot_active = False
+        self.pending_single_pixmap = None
         if not enabled:
             self.monitor_timer.stop()
             if self.region_frame:
                 self.region_frame.hide()
-            self.status.setText("监测已暂停，区域仍保留")
+            self.status.setText("单次模式 · 点击「选择屏幕区域」后立即识别一次")
             return
         if not self.region_rect:
             self.status.setText("监测已开启 · 请先选择屏幕区域")
@@ -542,10 +543,13 @@ class MainWindow(QMainWindow):
         self.generation += 1
         if self.worker:
             self.worker.cancel_requested = True
+        self.pending_single_pixmap = None
         self.processed_signature = None
         self.last_changed_at = time.monotonic()
         if self.region_rect and self.monitor_toggle.isChecked():
             self.status.setText("模式已更新 · 等待画面稳定…")
+        elif not self.monitor_toggle.isChecked():
+            self.status.setText("模式已更新 · 下次选区时生效")
 
     def capture_region(self) -> QPixmap:
         if self.region_screen is None or self.region_rect is None:
@@ -558,7 +562,7 @@ class MainWindow(QMainWindow):
     def poll_region(self):
         if not self.monitor_toggle.isChecked() or self.region_rect is None:
             return
-        if (self.region_screen is not None and self.isVisible() and
+        if (not self.capture_excluded and self.region_screen is not None and self.isVisible() and
                 self.frameGeometry().intersects(
                     self.region_rect.translated(self.region_screen.geometry().topLeft()))):
             self.status.setText("应用窗口挡住了监测区域，请将窗口移到选区外")
@@ -573,8 +577,6 @@ class MainWindow(QMainWindow):
             self.last_signature = signature
             self.last_changed_at = time.monotonic()
             self.candidate_pixmap = pixmap
-            self.preview_pixmap = pixmap
-            self.update_preview()
             self.generation += 1
             if self.worker:
                 self.worker.cancel_requested = True
@@ -611,7 +613,7 @@ class MainWindow(QMainWindow):
         worker.start()
 
     def is_current(self, generation: int) -> bool:
-        return generation == self.generation and self.monitor_toggle.isChecked()
+        return generation == self.generation
 
     def show_stage(self, generation: int, message: str):
         if self.is_current(generation):
@@ -627,26 +629,27 @@ class MainWindow(QMainWindow):
 
     def on_error(self, generation: int, message: str):
         if self.is_current(generation):
-            self.status.setText(message + " · 画面变化或重新开启监测后可重试")
+            retry = "重新选区后可重试" if self.single_shot_active else "画面变化或重启监测后可重试"
+            self.status.setText(message + " · " + retry)
 
     def on_finished(self, generation: int, worker: RecognitionThread):
         if self.is_current(generation) and self.status.text().startswith(("正在", "题目已转写")):
-            self.status.setText("监测中 · 转写完成，等待画面变化")
+            self.status.setText("单次转写完成 · 可再次选区" if self.single_shot_active else
+                                "监测中 · 转写完成，等待画面变化")
         if self.worker is worker:
             worker.deleteLater()
             self.worker = None
+        if self.pending_single_pixmap is not None:
+            QTimer.singleShot(0, self.start_pending_single_shot)
+            return
+        if self.single_shot_active:
+            self.single_shot_active = False
         if self.monitor_timer.isActive():
             QTimer.singleShot(0, self.poll_region)
 
-    def update_preview(self):
-        if self.preview_pixmap:
-            self.preview.setPixmap(self.preview_pixmap.scaled(
-                self.preview.size(), Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation))
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        self.update_preview()
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.capture_excluded = exclude_window_from_capture(int(self.winId()))
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():

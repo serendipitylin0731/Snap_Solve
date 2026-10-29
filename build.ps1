@@ -26,7 +26,12 @@ if (-not $compiler) {
 if (-not $compiler -or -not (Test-Path -LiteralPath $compiler)) {
     throw 'Inno Setup 6 is required: https://jrsoftware.org/isinfo.php'
 }
-& $compiler installer.iss
+$staging = Join-Path $PSScriptRoot ('build\installer-output-' + [guid]::NewGuid().ToString('N'))
+& $compiler "/O$staging" installer.iss
 if ($LASTEXITCODE -ne 0) { throw 'Installer build failed' }
+$builtInstaller = Join-Path $staging 'SnapSolve-1.0.0-Windows-x64-Setup.exe'
+$releaseDirectory = Join-Path $PSScriptRoot 'release'
+New-Item -ItemType Directory -Path $releaseDirectory -Force | Out-Null
+Copy-Item -LiteralPath $builtInstaller -Destination (Join-Path $releaseDirectory 'SnapSolve-1.0.0-Windows-x64-Setup.exe') -Force
 Get-ChildItem -LiteralPath release -Filter '*.exe' | Select-Object FullName,Length
 

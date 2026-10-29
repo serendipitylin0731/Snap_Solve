@@ -1,6 +1,7 @@
 import io
 import json
 import os
+import sys
 import time
 import unittest
 from unittest.mock import patch
@@ -8,7 +9,7 @@ from urllib.error import HTTPError
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 from PySide6.QtCore import QPoint, Qt
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtTest import QTest
@@ -176,9 +177,85 @@ class UiTests(unittest.TestCase):
             self.assertEqual(window.question_card.editor.toPlainText(), "# 第 2 题")
         window.close()
 
+    def test_single_shot_mode_runs_once_without_region(self):
+        window = MainWindow()
+        window.show()
+        window.monitor_toggle.setChecked(False)
+        requests = []
+
+        def fake_stream(key, image, update, cancelled):
+            requests.append(image)
+            text = f"# 单次题目 {len(requests)}"
+            update(text)
+            return text
+
+        def fake_solve(key, markdown, image, update, cancelled):
+            update("## 单次题解")
+            return "## 单次题解"
+
+        with patch("snap_solve.ui.get_api_key", return_value="test-key"), \
+             patch("snap_solve.ui.transcribe_stream", side_effect=fake_stream), \
+             patch("snap_solve.ui.solve_stream", side_effect=fake_solve):
+            window.start_capture()
+            QTest.qWait(400)
+            overlay = window.overlays[0]
+            QTest.mousePress(overlay, Qt.MouseButton.LeftButton, pos=QPoint(40, 50))
+            QTest.mouseMove(overlay, QPoint(250, 170))
+            QTest.mouseRelease(overlay, Qt.MouseButton.LeftButton, pos=QPoint(250, 170))
+            for _ in range(30):
+                QTest.qWait(100)
+                if requests and window.worker is None:
+                    break
+            self.assertEqual(window.question_card.editor.toPlainText(), "# 单次题目 1")
+            self.assertEqual(len(requests), 1)
+            self.assertFalse(window.monitor_timer.isActive())
+            self.assertIsNone(window.region_rect)
+            self.assertIsNone(window.region_frame)
+            QTest.qWait(800)
+            self.assertEqual(len(requests), 1)
+            window.solve_toggle.setChecked(True)
+            window.start_capture()
+            QTest.qWait(400)
+            overlay = window.overlays[0]
+            QTest.mousePress(overlay, Qt.MouseButton.LeftButton, pos=QPoint(50, 60))
+            QTest.mouseMove(overlay, QPoint(270, 190))
+            QTest.mouseRelease(overlay, Qt.MouseButton.LeftButton, pos=QPoint(270, 190))
+            for _ in range(30):
+                QTest.qWait(100)
+                if len(requests) == 2 and window.worker is None:
+                    break
+            self.assertEqual(window.question_card.editor.toPlainText(), "# 单次题目 2")
+            self.assertEqual(window.solution_card.editor.toPlainText(), "## 单次题解")
+            self.assertEqual(len(requests), 2)
+        window.close()
+
+    @unittest.skipUnless(sys.platform == "win32" and sys.getwindowsversion().build >= 19041,
+                         "Windows capture exclusion requires Windows 10 2004+")
+    def test_app_window_is_excluded_from_screen_grab(self):
+        window = MainWindow()
+        window.show()
+        window.raise_()
+        cover = QWidget(window)
+        cover.setStyleSheet("background: rgb(250, 0, 0);")
+        cover.setGeometry(window.rect())
+        cover.show()
+        QTest.qWait(300)
+        self.assertTrue(window.capture_excluded)
+        local = window.rect().center()
+        global_point = window.mapToGlobal(local)
+        screen = window.screen()
+        screen_point = global_point - screen.geometry().topLeft()
+        captured = screen.grabWindow(0, screen_point.x(), screen_point.y(), 1, 1)
+        r, g, b, _ = captured.toImage().pixelColor(0, 0).getRgb()
+        self.assertFalse(r > 200 and g < 40 and b < 40)
+        window.close()
+
     def test_live_screen_stays_on_one_recognition(self):
         window = MainWindow()
         window.show()
+        screen = window.screen()
+        start = window.mapToGlobal(QPoint(90, 110)) - screen.geometry().topLeft()
+        end = window.mapToGlobal(QPoint(310, 240)) - screen.geometry().topLeft()
         requests = []
 
         def fake_stream(key, image, update, cancelled):
@@ -190,10 +267,12 @@ class UiTests(unittest.TestCase):
              patch("snap_solve.ui.transcribe_stream", side_effect=fake_stream):
             window.start_capture()
             QTest.qWait(400)
-            overlay = window.overlays[0]
-            QTest.mousePress(overlay, Qt.MouseButton.LeftButton, pos=QPoint(20, 30))
-            QTest.mouseMove(overlay, QPoint(260, 150))
-            QTest.mouseRelease(overlay, Qt.MouseButton.LeftButton, pos=QPoint(260, 150))
+            overlay = next(item for item in window.overlays if item.screen is screen)
+            QTest.mousePress(overlay, Qt.MouseButton.LeftButton, pos=start)
+            QTest.mouseMove(overlay, end)
+            QTest.mouseRelease(overlay, Qt.MouseButton.LeftButton, pos=end)
+            self.assertTrue(window.frameGeometry().intersects(
+                window.region_rect.translated(screen.geometry().topLeft())))
             for _ in range(50):
                 QTest.qWait(100)
                 if requests and window.worker is None:
