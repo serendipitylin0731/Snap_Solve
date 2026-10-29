@@ -18,7 +18,7 @@ from PySide6.QtTest import QTest
 from snap_solve import deepseek
 from snap_solve.hotkey import HOTKEY_ID, WM_HOTKEY, MOD_ALT, MOD_CONTROL, windows_hotkey
 from snap_solve.monitor import image_signature
-from snap_solve.ui import MainWindow
+from snap_solve.ui import MainWindow, SettingsDialog
 
 
 class DeepSeekTests(unittest.TestCase):
@@ -67,6 +67,7 @@ class DeepSeekTests(unittest.TestCase):
         self.assertEqual(requests[1]["thinking"], {"type": "enabled"})
         self.assertEqual(requests[1]["reasoning_effort"], "high")
         self.assertIn("# 题目", requests[1]["messages"][0]["content"][0]["text"])
+        self.assertIn("行内公式用 $...$，独立公式用 $$...$$", requests[1]["messages"][0]["content"][0]["text"])
 
 
 class FakeResponseStream:
@@ -99,6 +100,7 @@ class UiTests(unittest.TestCase):
     def test_header_icon_and_side_by_side_results(self):
         window = MainWindow()
         window.show()
+        self.assertEqual(window.windowTitle(), "Snap Solve")
         logo = window.findChild(QLabel, "brandIcon")
         self.assertIsNotNone(logo)
         self.assertFalse(logo.pixmap().isNull())
@@ -107,6 +109,22 @@ class UiTests(unittest.TestCase):
         QApplication.processEvents()
         self.assertLess(window.question_card.geometry().right(),
                         window.solution_card.geometry().left())
+        window.close()
+
+    def test_theme_switch_and_settings_selection(self):
+        window = MainWindow()
+        window.show()
+        with patch("snap_solve.ui.save_theme_mode") as saved:
+            window.set_theme_mode("dark")
+            self.assertTrue(window.dark_mode)
+            self.assertIn("#111b2b", window.styleSheet())
+            dialog = SettingsDialog(window)
+            self.assertEqual(dialog.theme_input.currentData(), "dark")
+            dialog.close()
+            window.set_theme_mode("light")
+            self.assertFalse(window.dark_mode)
+            self.assertIn("#f3f7fd", window.styleSheet())
+            self.assertEqual(saved.call_count, 2)
         window.close()
 
     def test_shortcut_validation_and_custom_binding(self):

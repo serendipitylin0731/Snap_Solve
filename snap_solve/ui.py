@@ -9,40 +9,18 @@ from ctypes import wintypes
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPoint, QRect, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QFrame, QHBoxLayout, QKeySequenceEdit, QLabel, QLineEdit,
+    QApplication, QCheckBox, QComboBox, QDialog, QFrame, QHBoxLayout, QKeySequenceEdit, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
     QVBoxLayout, QWidget,
 )
 
-from . import __version__
 from .capture import exclude_window_from_capture
 from .config import get_api_key, save_api_key
 from .deepseek import DeepSeekError, StreamCancelled, solve_stream, transcribe_stream
 from .hotkey import (DEFAULT_SHORTCUT, HOTKEY_ID, WM_HOTKEY, load_shortcut,
                      register_hotkey, save_shortcut, unregister_hotkey, windows_hotkey)
 from .monitor import POLL_MILLISECONDS, STABLE_SECONDS, has_meaningful_change, image_signature
-
-
-STYLE = """
-QWidget { color: #202b3e; font-family: 'Microsoft YaHei UI', 'Segoe UI'; font-size: 13px; }
-QMainWindow, QDialog { background: #f5f7fb; }
-QFrame#card { background: #ffffff; border: 1px solid #e4e9f1; border-radius: 16px; }
-QFrame#header { background: #f5f7fb; border: 0; }
-QLabel#title { color: #15233b; font-size: 23px; font-weight: 700; }
-QLabel#section { color: #1d2d46; font-size: 15px; font-weight: 700; }
-QLabel#muted { color: #7d8aa0; }
-QPushButton { border: 1px solid #dce3ee; border-radius: 9px; background: #fff; padding: 9px 15px; font-weight: 600; }
-QPushButton:hover { background: #f1f5fb; border-color: #b9c7db; }
-QPushButton:disabled { color: #9ca9bb; background: #f1f3f7; }
-QPushButton#primary { background: #246aee; color: white; border-color: #246aee; padding: 10px 20px; }
-QPushButton#primary:hover { background: #175bd8; }
-QPushButton#primary:disabled { background: #a7c2f8; border-color: #a7c2f8; color: #fff; }
-QPushButton#quiet { border: 0; color: #4a6080; padding: 8px 10px; }
-QCheckBox { spacing: 9px; font-weight: 600; }
-QCheckBox::indicator { width: 17px; height: 17px; }
-QPlainTextEdit, QLineEdit, QKeySequenceEdit { border: 1px solid #e0e7f1; border-radius: 10px; background: #fbfcff; padding: 12px; selection-background-color: #bcd3ff; }
-QPlainTextEdit:focus, QLineEdit:focus, QKeySequenceEdit:focus { border-color: #6a9bfa; }
-"""
+from .theme import DARK, LIGHT, load_theme_mode, match_native_caption, save_theme_mode, style_sheet, uses_dark_colors
 
 
 def icon() -> QIcon:
@@ -158,12 +136,27 @@ class RegionFrame(QWidget):
         exclude_window_from_capture(int(self.winId()))
 
 
+class ThemeComboBox(QComboBox):
+    def __init__(self, dark: bool):
+        super().__init__()
+        self.arrow_color = QColor((DARK if dark else LIGHT)["muted"])
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(self.arrow_color, 2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        x, y = self.width() - 22, self.height() // 2
+        painter.drawLine(x - 5, y - 2, x, y + 3)
+        painter.drawLine(x, y + 3, x + 5, y - 2)
+
+
 class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("设置")
         self.setFixedWidth(470)
-        self.setStyleSheet(STYLE)
+        self.setStyleSheet(style_sheet(parent.dark_mode))
         layout = QVBoxLayout(self)
         layout.setContentsMargins(26, 25, 26, 24)
         layout.setSpacing(14)
@@ -199,6 +192,17 @@ class SettingsDialog(QDialog):
         shortcut_note = QLabel("全局生效；支持 Ctrl、Alt、Shift + 字母、数字或 F1–F11。")
         shortcut_note.setObjectName("muted")
         layout.addWidget(shortcut_note)
+
+        theme_label = QLabel("外观")
+        theme_label.setObjectName("section")
+        layout.addWidget(theme_label)
+        self.theme_input = ThemeComboBox(parent.dark_mode)
+        self.theme_input.addItem("跟随系统", "system")
+        self.theme_input.addItem("浅色", "light")
+        self.theme_input.addItem("深色", "dark")
+        self.theme_input.setCurrentIndex(self.theme_input.findData(parent.theme_mode))
+        layout.addWidget(self.theme_input)
+
         row = QHBoxLayout()
         row.addStretch()
         cancel = QPushButton("取消")
@@ -217,10 +221,15 @@ class SettingsDialog(QDialog):
             if self.key_input.text().strip():
                 save_api_key(self.key_input.text())
             self.parent().bind_shortcut(sequence, persist=True, strict=True)
+            self.parent().set_theme_mode(self.theme_input.currentData())
         except Exception as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
             return
         self.accept()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        match_native_caption(self, self.parent().dark_mode)
 
 
 class RecognitionThread(QThread):
@@ -281,15 +290,15 @@ class RecognitionThread(QThread):
 
 
 class MarkdownCard(QFrame):
-    def __init__(self, title: str, placeholder: str):
+    def __init__(self, title: str, placeholder: str, accent: str):
         super().__init__()
-        self.setObjectName("card")
+        self.setObjectName(f"{accent}Card")
         layout = QVBoxLayout(self)
         layout.setContentsMargins(19, 18, 19, 18)
         layout.setSpacing(12)
         top = QHBoxLayout()
         label = QLabel(title)
-        label.setObjectName("section")
+        label.setObjectName(f"{accent}Section")
         top.addWidget(label)
         top.addStretch()
         self.copy_button = QPushButton("复制 Markdown")
@@ -315,11 +324,14 @@ class MarkdownCard(QFrame):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"Snap Solve  ·  v{__version__}")
+        self.setWindowTitle("Snap Solve")
         self.setWindowIcon(icon())
         self.setMinimumSize(890, 650)
         self.resize(1180, 760)
-        self.setStyleSheet(STYLE)
+        self.theme_mode = load_theme_mode()
+        self.dark_mode = uses_dark_colors(self.theme_mode)
+        self.setStyleSheet(style_sheet(self.dark_mode))
+        QApplication.styleHints().colorSchemeChanged.connect(self.on_system_color_scheme_changed)
         self.overlays: list[CaptureOverlay] = []
         self.worker: RecognitionThread | None = None
         self.pending_single_pixmap: QPixmap | None = None
@@ -393,8 +405,8 @@ class MainWindow(QMainWindow):
 
         results = QHBoxLayout()
         results.setSpacing(18)
-        self.question_card = MarkdownCard("题目 · Markdown 源码", "截图中的题目会显示在这里，可编辑、选择和复制。")
-        self.solution_card = MarkdownCard("题解 · Markdown 源码", "勾选「同时解题」后，题解会显示在这里。")
+        self.question_card = MarkdownCard("题目 · Markdown 源码", "截图中的题目会显示在这里，可编辑、选择和复制。", "question")
+        self.solution_card = MarkdownCard("题解 · Markdown 源码", "勾选「同时解题」后，题解会显示在这里。", "solution")
         results.addWidget(self.question_card, 1)
         results.addWidget(self.solution_card, 1)
         self.solution_card.hide()
@@ -405,6 +417,20 @@ class MainWindow(QMainWindow):
         outer.addWidget(content, 1)
         self.local_shortcut = QShortcut(self.hotkey_sequence, self)
         self.local_shortcut.activated.connect(self.start_capture)
+
+    def set_theme_mode(self, mode: str) -> None:
+        save_theme_mode(mode)
+        self.theme_mode = mode
+        self.apply_theme()
+
+    def on_system_color_scheme_changed(self, _scheme) -> None:
+        if self.theme_mode == "system":
+            self.apply_theme()
+
+    def apply_theme(self) -> None:
+        self.dark_mode = uses_dark_colors(self.theme_mode)
+        self.setStyleSheet(style_sheet(self.dark_mode))
+        match_native_caption(self, self.dark_mode)
 
     def open_settings(self):
         self.shortcut_editing = True
@@ -646,7 +672,7 @@ class MainWindow(QMainWindow):
                 self.worker is None):
             if not get_api_key():
                 self.monitor_toggle.setChecked(False)
-                self.status.setText("请先在「API 设置」填写 DeepSeek Key")
+                self.status.setText("请先在「设置」填写 DeepSeek Key")
                 return
             self.processed_signature = self.last_signature
             self.start_recognition(self.candidate_pixmap if self.candidate_pixmap is not None else pixmap)
@@ -708,6 +734,7 @@ class MainWindow(QMainWindow):
 
     def showEvent(self, event):
         super().showEvent(event)
+        match_native_caption(self, self.dark_mode)
         self.capture_excluded = exclude_window_from_capture(int(self.winId()))
         if not self.hotkey_initialized:
             self.hotkey_initialized = True

@@ -30,9 +30,9 @@ if (-not $compiler -or -not (Test-Path -LiteralPath $compiler)) {
 $staging = Join-Path $PSScriptRoot ('build\installer-output-' + [guid]::NewGuid().ToString('N'))
 & $compiler "/O$staging" "/DAppDistDir=$(Join-Path $distRoot 'SnapSolve')" installer.iss
 if ($LASTEXITCODE -ne 0) { throw 'Installer build failed' }
-$builtInstaller = Join-Path $staging 'SnapSolve-1.0.1-Windows-x64-Setup.exe'
+$builtInstaller = Join-Path $staging 'SnapSolve-1.0.2-Windows-x64-Setup.exe'
 $releaseDirectory = Join-Path $PSScriptRoot 'release'
 New-Item -ItemType Directory -Path $releaseDirectory -Force | Out-Null
-Copy-Item -LiteralPath $builtInstaller -Destination (Join-Path $releaseDirectory 'SnapSolve-1.0.1-Windows-x64-Setup.exe') -Force
+Copy-Item -LiteralPath $builtInstaller -Destination (Join-Path $releaseDirectory 'SnapSolve-1.0.2-Windows-x64-Setup.exe') -Force
 Get-ChildItem -LiteralPath release -Filter '*.exe' | Select-Object FullName,Length
 
