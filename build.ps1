@@ -13,7 +13,8 @@ if (-not $SkipDependencies) {
 }
 & $python scripts\make_icon.py
 if ($LASTEXITCODE -ne 0) { throw 'Icon generation failed' }
-& $python -m PyInstaller --noconfirm --clean --windowed --onedir --name SnapSolve --icon assets\app.ico --collect-submodules keyring.backends launcher.py
+$distRoot = Join-Path $PSScriptRoot ('build\dist-' + [guid]::NewGuid().ToString('N'))
+& $python -m PyInstaller --noconfirm --clean --windowed --onedir --name SnapSolve --distpath $distRoot --icon assets\app.ico --collect-submodules keyring.backends launcher.py
 if ($LASTEXITCODE -ne 0) { throw 'Application build failed' }
 
 $compiler = (Get-Command ISCC.exe -ErrorAction SilentlyContinue).Source
@@ -27,11 +28,11 @@ if (-not $compiler -or -not (Test-Path -LiteralPath $compiler)) {
     throw 'Inno Setup 6 is required: https://jrsoftware.org/isinfo.php'
 }
 $staging = Join-Path $PSScriptRoot ('build\installer-output-' + [guid]::NewGuid().ToString('N'))
-& $compiler "/O$staging" installer.iss
+& $compiler "/O$staging" "/DAppDistDir=$(Join-Path $distRoot 'SnapSolve')" installer.iss
 if ($LASTEXITCODE -ne 0) { throw 'Installer build failed' }
-$builtInstaller = Join-Path $staging 'SnapSolve-1.0.0-Windows-x64-Setup.exe'
+$builtInstaller = Join-Path $staging 'SnapSolve-1.0.1-Windows-x64-Setup.exe'
 $releaseDirectory = Join-Path $PSScriptRoot 'release'
 New-Item -ItemType Directory -Path $releaseDirectory -Force | Out-Null
-Copy-Item -LiteralPath $builtInstaller -Destination (Join-Path $releaseDirectory 'SnapSolve-1.0.0-Windows-x64-Setup.exe') -Force
+Copy-Item -LiteralPath $builtInstaller -Destination (Join-Path $releaseDirectory 'SnapSolve-1.0.1-Windows-x64-Setup.exe') -Force
 Get-ChildItem -LiteralPath release -Filter '*.exe' | Select-Object FullName,Length
 

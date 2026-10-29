@@ -2,20 +2,24 @@
 
 from __future__ import annotations
 
+import sys
 import time
+from ctypes import wintypes
 
 from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPoint, QRect, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
+    QApplication, QCheckBox, QDialog, QFrame, QHBoxLayout, QKeySequenceEdit, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
     QVBoxLayout, QWidget,
 )
 
 from . import __version__
 from .capture import exclude_window_from_capture
-from .config import get_api_key, save_api_key, setting
+from .config import get_api_key, save_api_key
 from .deepseek import DeepSeekError, StreamCancelled, solve_stream, transcribe_stream
+from .hotkey import (DEFAULT_SHORTCUT, HOTKEY_ID, WM_HOTKEY, load_shortcut,
+                     register_hotkey, save_shortcut, unregister_hotkey, windows_hotkey)
 from .monitor import POLL_MILLISECONDS, STABLE_SECONDS, has_meaningful_change, image_signature
 
 
@@ -23,12 +27,10 @@ STYLE = """
 QWidget { color: #202b3e; font-family: 'Microsoft YaHei UI', 'Segoe UI'; font-size: 13px; }
 QMainWindow, QDialog { background: #f5f7fb; }
 QFrame#card { background: #ffffff; border: 1px solid #e4e9f1; border-radius: 16px; }
-QFrame#header { background: #ffffff; border-bottom: 1px solid #e4e9f1; }
-QLabel#eyebrow { color: #73829b; font-size: 11px; font-weight: 600; }
+QFrame#header { background: #f5f7fb; border: 0; }
 QLabel#title { color: #15233b; font-size: 23px; font-weight: 700; }
 QLabel#section { color: #1d2d46; font-size: 15px; font-weight: 700; }
 QLabel#muted { color: #7d8aa0; }
-QLabel#pill { color: #276e67; background: #e3f5ef; border-radius: 9px; padding: 5px 10px; font-size: 11px; }
 QPushButton { border: 1px solid #dce3ee; border-radius: 9px; background: #fff; padding: 9px 15px; font-weight: 600; }
 QPushButton:hover { background: #f1f5fb; border-color: #b9c7db; }
 QPushButton:disabled { color: #9ca9bb; background: #f1f3f7; }
@@ -38,8 +40,8 @@ QPushButton#primary:disabled { background: #a7c2f8; border-color: #a7c2f8; color
 QPushButton#quiet { border: 0; color: #4a6080; padding: 8px 10px; }
 QCheckBox { spacing: 9px; font-weight: 600; }
 QCheckBox::indicator { width: 17px; height: 17px; }
-QPlainTextEdit, QLineEdit { border: 1px solid #e0e7f1; border-radius: 10px; background: #fbfcff; padding: 12px; selection-background-color: #bcd3ff; }
-QPlainTextEdit:focus, QLineEdit:focus { border-color: #6a9bfa; }
+QPlainTextEdit, QLineEdit, QKeySequenceEdit { border: 1px solid #e0e7f1; border-radius: 10px; background: #fbfcff; padding: 12px; selection-background-color: #bcd3ff; }
+QPlainTextEdit:focus, QLineEdit:focus, QKeySequenceEdit:focus { border-color: #6a9bfa; }
 """
 
 
@@ -156,19 +158,19 @@ class RegionFrame(QWidget):
         exclude_window_from_capture(int(self.winId()))
 
 
-class ApiKeyDialog(QDialog):
+class SettingsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("DeepSeek API 设置")
-        self.setFixedWidth(440)
+        self.setWindowTitle("设置")
+        self.setFixedWidth(470)
         self.setStyleSheet(STYLE)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(26, 25, 26, 24)
         layout.setSpacing(14)
-        title = QLabel("连接 DeepSeek")
+        title = QLabel("DeepSeek API Key")
         title.setObjectName("section")
         layout.addWidget(title)
-        note = QLabel("输入 API Key 后保存在 Windows 凭据管理器。也可以在 .env 中配置。")
+        note = QLabel("在应用中填写的 Key 保存在 Windows 凭据管理器；也可以使用 .env。")
         note.setWordWrap(True)
         note.setObjectName("muted")
         layout.addWidget(note)
@@ -181,6 +183,22 @@ class ApiKeyDialog(QDialog):
         reveal.toggled.connect(lambda checked: self.key_input.setEchoMode(
             QLineEdit.EchoMode.Normal if checked else QLineEdit.EchoMode.Password))
         layout.addWidget(reveal)
+
+        shortcut_label = QLabel("截图快捷键")
+        shortcut_label.setObjectName("section")
+        layout.addWidget(shortcut_label)
+        shortcut_row = QHBoxLayout()
+        self.shortcut_input = QKeySequenceEdit(parent.hotkey_sequence)
+        self.shortcut_input.setMaximumSequenceLength(1)
+        self.shortcut_input.setClearButtonEnabled(True)
+        shortcut_row.addWidget(self.shortcut_input, 1)
+        reset = QPushButton("恢复默认")
+        reset.clicked.connect(lambda: self.shortcut_input.setKeySequence(QKeySequence(DEFAULT_SHORTCUT)))
+        shortcut_row.addWidget(reset)
+        layout.addLayout(shortcut_row)
+        shortcut_note = QLabel("全局生效；支持 Ctrl、Alt、Shift + 字母、数字或 F1–F11。")
+        shortcut_note.setObjectName("muted")
+        layout.addWidget(shortcut_note)
         row = QHBoxLayout()
         row.addStretch()
         cancel = QPushButton("取消")
@@ -194,7 +212,11 @@ class ApiKeyDialog(QDialog):
 
     def save(self):
         try:
-            save_api_key(self.key_input.text())
+            sequence = self.shortcut_input.keySequence()
+            windows_hotkey(sequence)
+            if self.key_input.text().strip():
+                save_api_key(self.key_input.text())
+            self.parent().bind_shortcut(sequence, persist=True, strict=True)
         except Exception as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
             return
@@ -303,6 +325,11 @@ class MainWindow(QMainWindow):
         self.pending_single_pixmap: QPixmap | None = None
         self.single_shot_active = False
         self.capture_excluded = False
+        self.capture_in_progress = False
+        self.hotkey_sequence = load_shortcut()
+        self.hotkey_registered = False
+        self.hotkey_initialized = False
+        self.shortcut_editing = False
         self.region_screen = None
         self.region_rect: QRect | None = None
         self.region_frame: RegionFrame | None = None
@@ -324,24 +351,18 @@ class MainWindow(QMainWindow):
         header = QFrame()
         header.setObjectName("header")
         head = QHBoxLayout(header)
-        head.setContentsMargins(30, 18, 30, 18)
-        logo = QLabel("◩")
-        logo.setStyleSheet("color: #246aee; font-size: 29px; font-weight: bold;")
+        head.setContentsMargins(30, 23, 30, 10)
+        head.setSpacing(12)
+        logo = QLabel()
+        logo.setObjectName("brandIcon")
+        logo.setFixedSize(42, 42)
+        logo.setPixmap(icon().pixmap(42, 42))
         head.addWidget(logo)
-        brand = QVBoxLayout()
-        brand.setSpacing(0)
-        small = QLabel("SCREEN TO MARKDOWN")
-        small.setObjectName("eyebrow")
         name = QLabel("Snap Solve")
         name.setObjectName("title")
-        brand.addWidget(small)
-        brand.addWidget(name)
-        head.addLayout(brand)
+        head.addWidget(name)
         head.addStretch()
-        model = QLabel(f"DeepSeek · {setting('DEEPSEEK_MODEL', 'deepseek-flash')}")
-        model.setObjectName("pill")
-        head.addWidget(model)
-        settings = QPushButton("API 设置")
+        settings = QPushButton("设置")
         settings.setObjectName("quiet")
         settings.clicked.connect(self.open_settings)
         head.addWidget(settings)
@@ -370,28 +391,65 @@ class MainWindow(QMainWindow):
         action_row.addWidget(hint)
         body.addLayout(action_row)
 
-        right = QVBoxLayout()
-        right.setSpacing(18)
+        results = QHBoxLayout()
+        results.setSpacing(18)
         self.question_card = MarkdownCard("题目 · Markdown 源码", "截图中的题目会显示在这里，可编辑、选择和复制。")
         self.solution_card = MarkdownCard("题解 · Markdown 源码", "勾选「同时解题」后，题解会显示在这里。")
-        right.addWidget(self.question_card, 1)
-        right.addWidget(self.solution_card, 1)
+        results.addWidget(self.question_card, 1)
+        results.addWidget(self.solution_card, 1)
         self.solution_card.hide()
-        body.addLayout(right, 1)
-        self.status = QLabel("准备就绪  ·  Ctrl+Shift+A 选择区域")
+        body.addLayout(results, 1)
+        self.status = QLabel(f"准备就绪  ·  {self.hotkey_sequence.toString()} 选择区域")
         self.status.setObjectName("muted")
         body.addWidget(self.status)
         outer.addWidget(content, 1)
-        shortcut = QShortcut(QKeySequence("Ctrl+Shift+A"), self)
-        shortcut.activated.connect(self.start_capture)
+        self.local_shortcut = QShortcut(self.hotkey_sequence, self)
+        self.local_shortcut.activated.connect(self.start_capture)
 
     def open_settings(self):
-        ApiKeyDialog(self).exec()
+        self.shortcut_editing = True
+        if self.hotkey_registered:
+            unregister_hotkey(int(self.winId()))
+            self.hotkey_registered = False
+        self.local_shortcut.setEnabled(False)
+        try:
+            result = SettingsDialog(self).exec()
+        finally:
+            self.shortcut_editing = False
+            if not self.hotkey_registered:
+                self.bind_shortcut(self.hotkey_sequence)
+            self.local_shortcut.setEnabled(not self.hotkey_registered)
+        return result
+
+    def bind_shortcut(self, sequence: QKeySequence, *, persist: bool = False,
+                      strict: bool = False) -> None:
+        windows_hotkey(sequence)
+        previous = self.hotkey_sequence
+        if self.hotkey_registered:
+            unregister_hotkey(int(self.winId()))
+            self.hotkey_registered = False
+        registered = register_hotkey(int(self.winId()), sequence)
+        if strict and sys.platform == "win32" and not registered:
+            self.hotkey_registered = register_hotkey(int(self.winId()), previous)
+            self.local_shortcut.setKey(previous)
+            self.local_shortcut.setEnabled(not self.hotkey_registered and not self.shortcut_editing)
+            raise ValueError("快捷键已被其他程序占用，请换一组")
+        self.hotkey_sequence = sequence
+        self.hotkey_registered = registered
+        self.local_shortcut.setKey(sequence)
+        self.local_shortcut.setEnabled(not registered and not self.shortcut_editing)
+        if persist:
+            save_shortcut(sequence)
+        prefix = "全局快捷键" if registered else "窗口快捷键（全局组合被占用）"
+        self.status.setText(f"{prefix}：{sequence.toString()}  ·  选择屏幕区域")
 
     def start_capture(self):
+        if self.capture_in_progress or QApplication.activeModalWidget() is not None:
+            return
         if not get_api_key():
-            if ApiKeyDialog(self).exec() != QDialog.DialogCode.Accepted:
+            if self.open_settings() != QDialog.DialogCode.Accepted or not get_api_key():
                 return
+        self.capture_in_progress = True
         self.monitor_timer.stop()
         if self.region_frame:
             self.region_frame.hide()
@@ -416,6 +474,7 @@ class MainWindow(QMainWindow):
             overlay.close()
             overlay.deleteLater()
         self.overlays = []
+        self.capture_in_progress = False
         self.show()
         self.activateWindow()
 
@@ -650,6 +709,21 @@ class MainWindow(QMainWindow):
     def showEvent(self, event):
         super().showEvent(event)
         self.capture_excluded = exclude_window_from_capture(int(self.winId()))
+        if not self.hotkey_initialized:
+            self.hotkey_initialized = True
+            self.bind_shortcut(self.hotkey_sequence)
+
+    def nativeEvent(self, event_type, message):
+        if sys.platform == "win32":
+            try:
+                native = wintypes.MSG.from_address(int(message))
+            except (TypeError, ValueError):
+                native = None
+            if native is not None and native.message == WM_HOTKEY and native.wParam == HOTKEY_ID:
+                if not self.shortcut_editing:
+                    QTimer.singleShot(0, self.start_capture)
+                return True, 0
+        return super().nativeEvent(event_type, message)
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
@@ -659,5 +733,8 @@ class MainWindow(QMainWindow):
             self.monitor_timer.stop()
             if self.region_frame:
                 self.region_frame.close()
+            if self.hotkey_registered:
+                unregister_hotkey(int(self.winId()))
+                self.hotkey_registered = False
             super().closeEvent(event)
 

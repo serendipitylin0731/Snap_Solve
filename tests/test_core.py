@@ -3,18 +3,20 @@ import json
 import os
 import sys
 import time
+import ctypes
 import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ.setdefault("QT_QPA_PLATFORM", "windows" if sys.platform == "win32" else "offscreen")
 
-from PySide6.QtWidgets import QApplication, QWidget
+from PySide6.QtWidgets import QApplication, QLabel, QWidget
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtGui import QColor, QKeySequence, QPixmap
 from PySide6.QtTest import QTest
 
 from snap_solve import deepseek
+from snap_solve.hotkey import HOTKEY_ID, WM_HOTKEY, MOD_ALT, MOD_CONTROL, windows_hotkey
 from snap_solve.monitor import image_signature
 from snap_solve.ui import MainWindow
 
@@ -92,6 +94,47 @@ class UiTests(unittest.TestCase):
         window.solution_card.copy()
         self.assertEqual(self.app.clipboard().text(), "## 解答\n$x=2$")
         self.assertFalse(window.solve_toggle.isChecked())
+        window.close()
+
+    def test_header_icon_and_side_by_side_results(self):
+        window = MainWindow()
+        window.show()
+        logo = window.findChild(QLabel, "brandIcon")
+        self.assertIsNotNone(logo)
+        self.assertFalse(logo.pixmap().isNull())
+        self.assertFalse(window.windowIcon().isNull())
+        window.solve_toggle.setChecked(True)
+        QApplication.processEvents()
+        self.assertLess(window.question_card.geometry().right(),
+                        window.solution_card.geometry().left())
+        window.close()
+
+    def test_shortcut_validation_and_custom_binding(self):
+        self.assertEqual(windows_hotkey(QKeySequence("Ctrl+Alt+S")),
+                         (MOD_ALT | MOD_CONTROL | 0x4000, ord("S")))
+        with self.assertRaises(ValueError):
+            windows_hotkey(QKeySequence("S"))
+        window = MainWindow()
+        window.show()
+        sequence = QKeySequence("Ctrl+Alt+F8")
+        with patch("snap_solve.ui.register_hotkey", return_value=True), \
+             patch("snap_solve.ui.save_shortcut") as saved:
+            window.bind_shortcut(sequence, persist=True, strict=True)
+            saved.assert_called_once()
+        self.assertEqual(window.hotkey_sequence.toString(), "Ctrl+Alt+F8")
+        self.assertFalse(window.local_shortcut.isEnabled())
+        self.assertIn("Ctrl+Alt+F8", window.status.text())
+        window.close()
+
+    @unittest.skipUnless(sys.platform == "win32", "Windows global hotkey")
+    def test_windows_hotkey_message_starts_capture(self):
+        window = MainWindow()
+        window.show()
+        with patch.object(window, "start_capture") as capture:
+            ok = ctypes.windll.user32.PostMessageW(int(window.winId()), WM_HOTKEY, HOTKEY_ID, 0)
+            self.assertTrue(ok)
+            QTest.qWait(150)
+            capture.assert_called_once()
         window.close()
 
     def test_capture_to_both_markdown_boxes(self):

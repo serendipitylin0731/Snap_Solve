@@ -1,6 +1,9 @@
 #define MyAppName "Snap Solve"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppExeName "SnapSolve.exe"
+#ifndef AppDistDir
+  #define AppDistDir "dist\SnapSolve"
+#endif
 
 [Setup]
 AppId={{E9A7FE7C-C4AC-4DC1-9EF5-83CE6299F3CB}
@@ -23,7 +26,7 @@ ArchitecturesAllowed=x64compatible
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "其他选项："; Flags: unchecked
 
 [Files]
-Source: "dist\SnapSolve\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#AppDistDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: ".env.example"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]

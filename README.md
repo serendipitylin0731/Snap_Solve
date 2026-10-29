@@ -4,9 +4,9 @@
 
 ## 使用
 
-安装 Release 中的 Windows 安装包。首次启动点击「API 设置」填写 [DeepSeek API Key](https://platform.deepseek.com/)，也可在源码目录的 `.env` 中填写 `DEEPSEEK_API_KEY`。应用内填写的 Key 保存在 Windows 凭据管理器中；`.env` 不提交到 Git。
+安装 Release 中的 Windows 安装包。首次启动点击「设置」填写 [DeepSeek API Key](https://platform.deepseek.com/)，也可在源码目录的 `.env` 中填写 `DEEPSEEK_API_KEY`。应用内填写的 Key 保存在 Windows 凭据管理器中；`.env` 不提交到 Git。
 
-点击「选择屏幕区域」后，在任意一块显示器上拖动选区；按 Esc 取消。开启「持续监测」时，选区保持在屏幕上，每次画面变化并稳定约 1.5 秒会更新 Markdown。关闭「持续监测」时，选区立即识别一次；再次点击可读取另一张截图。快捷键 `Ctrl+Shift+A` 仅在应用窗口处于焦点时可用。
+点击「选择屏幕区域」后，在任意一块显示器上拖动选区；按 Esc 取消。开启「持续监测」时，选区保持在屏幕上，每次画面变化并稳定约 1.5 秒会更新 Markdown。关闭「持续监测」时，选区立即识别一次；再次点击可读取另一张截图。默认全局快捷键为 `Ctrl+Alt+S`，可以在「设置」中修改；如果快捷键已被其他程序占用，应用会在状态栏提示并仅在窗口中响应。
 
 Windows 10 2004 及更新版本中，应用窗口会从系统截图中排除，因此即使它盖在题目上，读取到的仍是下面的画面。旧版 Windows 会在可行时自动把窗口移出选区。
 
