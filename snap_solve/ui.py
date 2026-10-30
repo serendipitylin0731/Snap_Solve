@@ -10,13 +10,13 @@ from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPoint, QRect, QSetti
 from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QRegion, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFrame, QHBoxLayout, QKeySequenceEdit, QLabel, QLineEdit,
-    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
+    QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QSlider,
     QVBoxLayout, QWidget,
 )
 
 from .capture import exclude_window_from_capture, foreground_window, restore_foreground
-from .config import get_api_key, save_api_key
-from .deepseek import DeepSeekError, StreamCancelled, solve_stream, transcribe_stream
+from .config import get_api_key, save_api_key, setting
+from .deepseek import SOLVE_EFFORTS, DeepSeekError, StreamCancelled, solve_stream, transcribe_stream
 from .hotkey import (DEFAULT_SHORTCUT, HOTKEY_ID, WM_HOTKEY, load_shortcut,
                      register_hotkey, save_shortcut, unregister_hotkey, windows_hotkey)
 from .monitor import POLL_MILLISECONDS, STABLE_SECONDS, has_meaningful_change, image_signature
@@ -331,33 +331,39 @@ class RecognitionThread(QThread):
     solved = Signal(str)
     failed = Signal(str)
 
-    def __init__(self, api_key: str, image: bytes, solve_enabled: bool):
+    def __init__(self, api_key: str, image: bytes, transcribe_enabled: bool,
+                 solve_enabled: bool, solve_effort: str):
         super().__init__()
         self.api_key = api_key
         self.image = image
+        self.transcribe_enabled = transcribe_enabled
         self.solve_enabled = solve_enabled
+        self.solve_effort = solve_effort
         self.cancel_requested = False
 
     def run(self):
         try:
-            self.stage.emit("正在流式转写题目…")
-            last_question_emit = 0.0
+            markdown = None
+            if self.transcribe_enabled:
+                self.stage.emit("正在流式转写题目…")
+                last_question_emit = 0.0
 
-            def question_update(text: str):
-                nonlocal last_question_emit
-                now = time.monotonic()
-                if not self.cancel_requested and now - last_question_emit >= 0.08:
-                    self.recognized.emit(text)
-                    last_question_emit = now
+                def question_update(text: str):
+                    nonlocal last_question_emit
+                    now = time.monotonic()
+                    if not self.cancel_requested and now - last_question_emit >= 0.08:
+                        self.recognized.emit(text)
+                        last_question_emit = now
 
-            markdown = transcribe_stream(self.api_key, self.image,
-                                         question_update,
-                                         cancelled=lambda: self.cancel_requested)
-            if self.cancel_requested:
-                return
-            self.recognized.emit(markdown)
+                markdown = transcribe_stream(self.api_key, self.image,
+                                             question_update,
+                                             cancelled=lambda: self.cancel_requested)
+                if self.cancel_requested:
+                    return
+                self.recognized.emit(markdown)
             if self.solve_enabled:
-                self.stage.emit("题目已转写 · 正在仔细解题…")
+                self.stage.emit("题目已转写 · 正在仔细解题…" if self.transcribe_enabled else
+                                "正在根据截图仔细解题…")
                 last_solution_emit = 0.0
 
                 def solution_update(text: str):
@@ -369,7 +375,8 @@ class RecognitionThread(QThread):
 
                 solution = solve_stream(self.api_key, markdown, self.image,
                                         solution_update,
-                                        cancelled=lambda: self.cancel_requested)
+                                        cancelled=lambda: self.cancel_requested,
+                                        effort=self.solve_effort)
                 if not self.cancel_requested:
                     self.solved.emit(solution)
         except StreamCancelled:
@@ -490,7 +497,11 @@ class MainWindow(QMainWindow):
         self.monitor_toggle.setChecked(True)
         self.monitor_toggle.toggled.connect(self.on_monitor_toggled)
         action_row.addWidget(self.monitor_toggle)
-        self.solve_toggle = QCheckBox("同时解题")
+        self.transcribe_toggle = QCheckBox("转写题目")
+        self.transcribe_toggle.setChecked(True)
+        self.transcribe_toggle.toggled.connect(self.on_transcribe_toggled)
+        action_row.addWidget(self.transcribe_toggle)
+        self.solve_toggle = QCheckBox("解题")
         self.solve_toggle.toggled.connect(self.on_solve_toggled)
         action_row.addWidget(self.solve_toggle)
         action_row.addStretch()
@@ -499,10 +510,39 @@ class MainWindow(QMainWindow):
         action_row.addWidget(hint)
         body.addLayout(action_row)
 
+        self.effort_panel = QWidget()
+        effort_row = QHBoxLayout(self.effort_panel)
+        effort_row.setContentsMargins(0, 0, 0, 0)
+        effort_row.setSpacing(12)
+        effort_row.addWidget(QLabel("思考强度"))
+        effort_row.addWidget(QLabel("低"))
+        self.effort_slider = QSlider(Qt.Orientation.Horizontal)
+        self.effort_slider.setRange(0, len(SOLVE_EFFORTS) - 1)
+        self.effort_slider.setSingleStep(1)
+        self.effort_slider.setPageStep(1)
+        self.effort_slider.setFixedWidth(200)
+        saved_effort = QSettings("Snap Solve", "Snap Solve").value(
+            "solve_effort", setting("DEEPSEEK_SOLVE_EFFORT", "high"))
+        if saved_effort not in SOLVE_EFFORTS:
+            saved_effort = "high"
+        self.effort_slider.setValue(SOLVE_EFFORTS.index(saved_effort))
+        self.effort_slider.valueChanged.connect(self.on_solve_effort_changed)
+        effort_row.addWidget(self.effort_slider)
+        effort_row.addWidget(QLabel("最高"))
+        self.effort_label = QLabel(f"当前：{('低', '高', '最高')[self.effort_slider.value()]}")
+        self.effort_label.setObjectName("solutionSection")
+        effort_row.addWidget(self.effort_label)
+        effort_note = QLabel("强度越高，耗时和费用可能增加")
+        effort_note.setObjectName("muted")
+        effort_row.addWidget(effort_note)
+        effort_row.addStretch()
+        self.effort_panel.hide()
+        body.addWidget(self.effort_panel)
+
         results = QHBoxLayout()
         results.setSpacing(18)
         self.question_card = MarkdownCard("题目 · Markdown 源码", "截图中的题目会显示在这里，可编辑、选择和复制。", "question")
-        self.solution_card = MarkdownCard("题解 · Markdown 源码", "勾选「同时解题」后，题解会显示在这里。", "solution")
+        self.solution_card = MarkdownCard("题解 · Markdown 源码", "截图中的题解会显示在这里，可编辑、选择和复制。", "solution")
         results.addWidget(self.question_card, 1)
         results.addWidget(self.solution_card, 1)
         self.solution_card.hide()
@@ -769,9 +809,36 @@ class MainWindow(QMainWindow):
         self.monitor_timer.start()
         self.status.setText("监测中 · 等待画面稳定…")
 
+    def on_transcribe_toggled(self, enabled: bool):
+        self.question_card.editor.clear()
+        if not enabled and not self.solve_toggle.isChecked():
+            blocked = self.solve_toggle.blockSignals(True)
+            self.solve_toggle.setChecked(True)
+            self.solve_toggle.blockSignals(blocked)
+            self.solution_card.editor.clear()
+        self.update_mode()
+
     def on_solve_toggled(self, enabled: bool):
-        self.solution_card.setVisible(enabled)
         self.solution_card.editor.clear()
+        if not enabled and not self.transcribe_toggle.isChecked():
+            blocked = self.transcribe_toggle.blockSignals(True)
+            self.transcribe_toggle.setChecked(True)
+            self.transcribe_toggle.blockSignals(blocked)
+            self.question_card.editor.clear()
+        self.update_mode()
+
+    def on_solve_effort_changed(self, value: int):
+        self.effort_label.setText(f"当前：{('低', '高', '最高')[value]}")
+        QSettings("Snap Solve", "Snap Solve").setValue("solve_effort", SOLVE_EFFORTS[value])
+        if self.solve_toggle.isChecked() and self.monitor_toggle.isChecked() and self.region_rect:
+            self.update_mode()
+        elif self.solve_toggle.isChecked() and not self.monitor_toggle.isChecked() and self.worker is None:
+            self.status.setText("思考强度已更新 · 下次解题时生效")
+
+    def update_mode(self):
+        self.question_card.setVisible(self.transcribe_toggle.isChecked())
+        self.solution_card.setVisible(self.solve_toggle.isChecked())
+        self.effort_panel.setVisible(self.solve_toggle.isChecked())
         self.generation += 1
         if self.worker:
             self.worker.cancel_requested = True
@@ -781,7 +848,7 @@ class MainWindow(QMainWindow):
         if self.region_rect and self.monitor_toggle.isChecked():
             self.status.setText("模式已更新 · 等待画面稳定…")
         elif not self.monitor_toggle.isChecked():
-            self.status.setText("模式已更新 · 下次选区时生效")
+            self.status.setText("模式已更新 · 下次选取或调整选区时生效")
 
     def capture_region(self) -> QPixmap:
         if self.region_screen is None or self.region_rect is None:
@@ -844,7 +911,8 @@ class MainWindow(QMainWindow):
         pixmap.save(buffer, "PNG")
         buffer.close()
         generation = self.generation
-        worker = RecognitionThread(get_api_key(), bytes(output), self.solve_toggle.isChecked())
+        worker = RecognitionThread(get_api_key(), bytes(output), self.transcribe_toggle.isChecked(),
+                                   self.solve_toggle.isChecked(), SOLVE_EFFORTS[self.effort_slider.value()])
         self.worker = worker
         worker.stage.connect(lambda message: self.show_stage(generation, message))
         worker.recognized.connect(lambda text: self.show_question(generation, text))
@@ -861,7 +929,7 @@ class MainWindow(QMainWindow):
             self.status.setText(message)
 
     def show_question(self, generation: int, text: str):
-        if self.is_current(generation):
+        if self.is_current(generation) and self.transcribe_toggle.isChecked():
             self.question_card.editor.setPlainText(text)
 
     def show_solution(self, generation: int, text: str):
@@ -875,8 +943,9 @@ class MainWindow(QMainWindow):
 
     def on_finished(self, generation: int, worker: RecognitionThread):
         if self.is_current(generation) and self.status.text().startswith(("正在", "题目已转写")):
-            self.status.setText("单次转写完成 · 可再次选区" if self.single_shot_active else
-                                "监测中 · 转写完成，等待画面变化")
+            result = "解题" if self.solve_toggle.isChecked() else "转写"
+            self.status.setText(f"单次{result}完成 · 可再次选区" if self.single_shot_active else
+                                f"监测中 · {result}完成，等待画面变化")
         if self.worker is worker:
             worker.deleteLater()
             self.worker = None

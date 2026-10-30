@@ -1,5 +1,5 @@
 #define MyAppName "Snap Solve"
-#define MyAppVersion "1.0.3"
+#define MyAppVersion "1.0.4"
 #define MyAppExeName "SnapSolve.exe"
 #ifndef AppDistDir
   #define AppDistDir "dist\SnapSolve"

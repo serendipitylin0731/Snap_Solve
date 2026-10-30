@@ -60,6 +60,12 @@ QPushButton#quiet { border: 0; color: $accent; background: transparent; padding:
 QPushButton#quiet:hover { background: $button_hover; }
 QCheckBox { spacing: 9px; font-weight: 600; }
 QCheckBox::indicator { width: 17px; height: 17px; }
+QSlider::groove:horizontal { height: 5px; background: $border; border-radius: 2px; }
+QSlider::sub-page:horizontal { background: $accent; border-radius: 2px; }
+QSlider::handle:horizontal {
+    background: $accent; border: 2px solid $card; width: 16px; margin: -7px 0; border-radius: 9px;
+}
+QSlider::handle:horizontal:hover { background: $accent_hover; }
 QPlainTextEdit, QLineEdit, QKeySequenceEdit, QComboBox {
     border: 1px solid $border; border-radius: 10px; background: $input;
     padding: 10px; selection-background-color: $selection;
