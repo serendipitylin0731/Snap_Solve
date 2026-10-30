@@ -20,10 +20,13 @@ TRANSCRIBE_PROMPT = """请准确读取截图内容，并只输出 Markdown 源�
 SOLVE_EFFORTS = ("low", "high", "max")
 
 SOLVE_PROMPT = """请根据截图解答其中的题目。若附有题目转写，请结合截图核对文字、图形与符号。
-只输出 Markdown 格式题解，说明关键步骤。所有数学公式使用 LaTeX，并以 $ 定界：行内公式用 $...$，独立公式用 $$...$$；不要使用反斜杠括号或方括号形式的公式定界，也不要转义定界符 $。
+所有数学公式使用 LaTeX，并以 $ 定界：行内公式用 $...$，独立公式用 $$...$$；不要使用反斜杠括号或方括号形式的公式定界，也不要转义定界符 $。
 若存在多道题，请依题号分别解答。
 如题意不完整，请明确指出缺失信息并给出可确定的部分，不要猜测。
 不要再次抄写完整题目，也不要用代码围栏包住整份结果。"""
+
+SOLUTION_FORMAT = "只输出 Markdown 格式题解，说明关键步骤。"
+ANSWER_ONLY_FORMAT = "只输出每道题的最终答案，不要输出解析、推导、计算过程或解题步骤。若无法确定答案，请简短说明无法确定。"
 
 class DeepSeekError(Exception):
     pass
@@ -110,11 +113,12 @@ def transcribe_stream(api_key: str, image_png: bytes, on_update: Callable[[str],
 def solve_stream(api_key: str, markdown: str | None, image_png: bytes,
                  on_update: Callable[[str], None],
                  cancelled: Callable[[], bool] = lambda: False,
-                 effort: str | None = None) -> str:
+                 effort: str | None = None, answer_only: bool = False) -> str:
     effort = effort or setting("DEEPSEEK_SOLVE_EFFORT", "high")
     if effort not in SOLVE_EFFORTS:
         raise DeepSeekError("DEEPSEEK_SOLVE_EFFORT 只能是 low、high 或 max")
-    prompt = SOLVE_PROMPT + ("\n\n题目转写：\n" + markdown if markdown else "")
+    prompt = SOLVE_PROMPT + "\n" + (ANSWER_ONLY_FORMAT if answer_only else SOLUTION_FORMAT)
+    prompt += "\n\n题目转写：\n" + markdown if markdown else ""
     return _request_stream(api_key, prompt, image_png, on_update,
                            max_tokens=131072 if effort == "max" else 65536, cancelled=cancelled,
                            thinking="enabled", reasoning_effort=effort)

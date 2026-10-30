@@ -332,13 +332,14 @@ class RecognitionThread(QThread):
     failed = Signal(str)
 
     def __init__(self, api_key: str, image: bytes, transcribe_enabled: bool,
-                 solve_enabled: bool, solve_effort: str):
+                 solve_enabled: bool, solve_effort: str, answer_only: bool):
         super().__init__()
         self.api_key = api_key
         self.image = image
         self.transcribe_enabled = transcribe_enabled
         self.solve_enabled = solve_enabled
         self.solve_effort = solve_effort
+        self.answer_only = answer_only
         self.cancel_requested = False
 
     def run(self):
@@ -376,7 +377,7 @@ class RecognitionThread(QThread):
                 solution = solve_stream(self.api_key, markdown, self.image,
                                         solution_update,
                                         cancelled=lambda: self.cancel_requested,
-                                        effort=self.solve_effort)
+                                        effort=self.solve_effort, answer_only=self.answer_only)
                 if not self.cancel_requested:
                     self.solved.emit(solution)
         except StreamCancelled:
@@ -532,6 +533,11 @@ class MainWindow(QMainWindow):
         self.effort_label = QLabel(f"当前：{('低', '高', '最高')[self.effort_slider.value()]}")
         self.effort_label.setObjectName("solutionSection")
         effort_row.addWidget(self.effort_label)
+        self.answer_only_toggle = QCheckBox("只输出答案")
+        self.answer_only_toggle.setChecked(QSettings("Snap Solve", "Snap Solve").value(
+            "answer_only", False, type=bool))
+        self.answer_only_toggle.toggled.connect(self.on_answer_only_toggled)
+        effort_row.addWidget(self.answer_only_toggle)
         effort_note = QLabel("强度越高，耗时和费用可能增加")
         effort_note.setObjectName("muted")
         effort_row.addWidget(effort_note)
@@ -830,10 +836,17 @@ class MainWindow(QMainWindow):
     def on_solve_effort_changed(self, value: int):
         self.effort_label.setText(f"当前：{('低', '高', '最高')[value]}")
         QSettings("Snap Solve", "Snap Solve").setValue("solve_effort", SOLVE_EFFORTS[value])
+        self.on_solve_settings_changed()
+
+    def on_answer_only_toggled(self, enabled: bool):
+        QSettings("Snap Solve", "Snap Solve").setValue("answer_only", enabled)
+        self.on_solve_settings_changed()
+
+    def on_solve_settings_changed(self):
         if self.solve_toggle.isChecked() and self.monitor_toggle.isChecked() and self.region_rect:
             self.update_mode()
         elif self.solve_toggle.isChecked() and not self.monitor_toggle.isChecked() and self.worker is None:
-            self.status.setText("思考强度已更新 · 下次解题时生效")
+            self.status.setText("解题设置已更新 · 下次解题时生效")
 
     def update_mode(self):
         self.question_card.setVisible(self.transcribe_toggle.isChecked())
@@ -912,7 +925,8 @@ class MainWindow(QMainWindow):
         buffer.close()
         generation = self.generation
         worker = RecognitionThread(get_api_key(), bytes(output), self.transcribe_toggle.isChecked(),
-                                   self.solve_toggle.isChecked(), SOLVE_EFFORTS[self.effort_slider.value()])
+                                   self.solve_toggle.isChecked(), SOLVE_EFFORTS[self.effort_slider.value()],
+                                   self.answer_only_toggle.isChecked())
         self.worker = worker
         worker.stage.connect(lambda message: self.show_stage(generation, message))
         worker.recognized.connect(lambda text: self.show_question(generation, text))

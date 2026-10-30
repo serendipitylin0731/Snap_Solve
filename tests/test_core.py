@@ -88,6 +88,25 @@ class DeepSeekTests(unittest.TestCase):
             self.assertTrue(contents[1]["image_url"]["url"].startswith("data:image/png;base64,"))
             self.assertEqual(request["thinking"], {"type": "enabled"})
 
+    def test_answer_only_uses_distinct_prompt(self):
+        requests = []
+
+        def fake_urlopen(request, timeout):
+            requests.append(json.loads(request.data))
+            chunk = json.dumps({"choices": [{"delta": {"content": "$x=2$"}}]})
+            return FakeResponseStream(f"data: {chunk}\n\ndata: [DONE]\n\n".encode())
+
+        with patch.object(deepseek, "urlopen", fake_urlopen):
+            deepseek.solve_stream("test-key", "题目", b"image", lambda _: None, answer_only=True)
+            deepseek.solve_stream("test-key", "题目", b"image", lambda _: None, answer_only=False)
+        answer_prompt = requests[0]["messages"][0]["content"][0]["text"]
+        solution_prompt = requests[1]["messages"][0]["content"][0]["text"]
+        self.assertIn("只输出每道题的最终答案", answer_prompt)
+        self.assertIn("不要输出解析", answer_prompt)
+        self.assertNotIn("说明关键步骤", answer_prompt)
+        self.assertIn("说明关键步骤", solution_prompt)
+        self.assertIn("行内公式用 $...$，独立公式用 $$...$$", answer_prompt)
+
 
 class FakeResponseStream:
     def __init__(self, data):
@@ -223,7 +242,7 @@ class UiTests(unittest.TestCase):
             update("# 测试题")
             return "# 测试题"
 
-        def fake_solve(key, markdown, image, update, cancelled, effort):
+        def fake_solve(key, markdown, image, update, cancelled, effort, answer_only):
             update("## 解答")
             return "## 解答"
 
@@ -331,7 +350,7 @@ class UiTests(unittest.TestCase):
             update(text)
             return text
 
-        def fake_solve(key, markdown, image, update, cancelled, effort):
+        def fake_solve(key, markdown, image, update, cancelled, effort, answer_only):
             update("## 单次题解")
             return "## 单次题解"
 
@@ -401,13 +420,16 @@ class UiTests(unittest.TestCase):
             window.effort_slider.setValue(0)
             window.effort_slider.setValue(2)
             settings.return_value.setValue.assert_called_with("solve_effort", "max")
+            window.answer_only_toggle.setChecked(False)
+            window.answer_only_toggle.setChecked(True)
+            settings.return_value.setValue.assert_called_with("answer_only", True)
         self.assertEqual(window.effort_label.text(), "当前：最高")
         requests = []
 
-        def fake_solve(key, markdown, image, update, cancelled, effort):
-            requests.append((markdown, image, effort))
-            update("## 只有题解\n$x=2$")
-            return "## 只有题解\n$x=2$"
+        def fake_solve(key, markdown, image, update, cancelled, effort, answer_only):
+            requests.append((markdown, image, effort, answer_only))
+            update("$x=2$")
+            return "$x=2$"
 
         with patch("snap_solve.ui.get_api_key", return_value="test-key"), \
              patch("snap_solve.ui.transcribe_stream") as transcribe, \
@@ -427,7 +449,8 @@ class UiTests(unittest.TestCase):
             self.assertIsNone(requests[0][0])
             self.assertTrue(requests[0][1])
             self.assertEqual(requests[0][2], "max")
-            self.assertEqual(window.solution_card.editor.toPlainText(), "## 只有题解\n$x=2$")
+            self.assertTrue(requests[0][3])
+            self.assertEqual(window.solution_card.editor.toPlainText(), "$x=2$")
             self.assertIn("解题完成", window.status.text())
         window.solve_toggle.setChecked(False)
         self.assertTrue(window.transcribe_toggle.isChecked())
@@ -441,6 +464,7 @@ class UiTests(unittest.TestCase):
         window.transcribe_toggle.setChecked(False)
         with patch("snap_solve.ui.QSettings"):
             window.effort_slider.setValue(0)
+            window.answer_only_toggle.setChecked(False)
         pixmap = QPixmap(200, 100)
         pixmap.fill(QColor("white"))
         window.region_rect = QRect(0, 0, 200, 100)
@@ -450,8 +474,8 @@ class UiTests(unittest.TestCase):
         window.last_changed_at = time.monotonic() - 2
         requests = []
 
-        def fake_solve(key, markdown, image, update, cancelled, effort):
-            requests.append((markdown, effort))
+        def fake_solve(key, markdown, image, update, cancelled, effort, answer_only):
+            requests.append((markdown, effort, answer_only))
             update("## 解答")
             return "## 解答"
 
@@ -463,7 +487,7 @@ class UiTests(unittest.TestCase):
                 QTest.qWait(100)
                 if requests and window.worker is None:
                     break
-            self.assertEqual(requests, [(None, "low")])
+            self.assertEqual(requests, [(None, "low", False)])
             with patch("snap_solve.ui.QSettings"):
                 window.effort_slider.setValue(2)
             window.poll_region()
@@ -474,7 +498,18 @@ class UiTests(unittest.TestCase):
                 QTest.qWait(100)
                 if len(requests) == 2 and window.worker is None:
                     break
-            self.assertEqual(requests, [(None, "low"), (None, "max")])
+            self.assertEqual(requests, [(None, "low", False), (None, "max", False)])
+            with patch("snap_solve.ui.QSettings"):
+                window.answer_only_toggle.setChecked(True)
+            window.poll_region()
+            self.assertEqual(len(requests), 2)
+            window.last_changed_at = time.monotonic() - 2
+            window.poll_region()
+            for _ in range(30):
+                QTest.qWait(100)
+                if len(requests) == 3 and window.worker is None:
+                    break
+            self.assertEqual(requests[-1], (None, "max", True))
             transcribe.assert_not_called()
         window.close()
 
