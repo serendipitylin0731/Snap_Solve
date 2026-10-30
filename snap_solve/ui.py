@@ -6,15 +6,15 @@ import sys
 import time
 from ctypes import wintypes
 
-from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPoint, QRect, Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QShortcut
+from PySide6.QtCore import QBuffer, QByteArray, QIODevice, QPoint, QRect, QSettings, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QColor, QFont, QIcon, QKeySequence, QPainter, QPen, QPixmap, QRegion, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QFrame, QHBoxLayout, QKeySequenceEdit, QLabel, QLineEdit,
     QMainWindow, QMessageBox, QPlainTextEdit, QPushButton,
     QVBoxLayout, QWidget,
 )
 
-from .capture import exclude_window_from_capture
+from .capture import exclude_window_from_capture, foreground_window, restore_foreground
 from .config import get_api_key, save_api_key
 from .deepseek import DeepSeekError, StreamCancelled, solve_stream, transcribe_stream
 from .hotkey import (DEFAULT_SHORTCUT, HOTKEY_ID, WM_HOTKEY, load_shortcut,
@@ -114,26 +114,114 @@ class CaptureOverlay(QWidget):
 
 
 class RegionFrame(QWidget):
-    """A non-interactive outline outside the selected capture area."""
+    """A resizeable outline with a mouse-transparent interior."""
+
+    interaction_started = Signal()
+    interaction_finished = Signal(QRect, bool)
+    MARGIN = 8
+    HIT = 12
+    MIN_SIZE = 12
 
     def __init__(self, screen, region: QRect):
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint |
-                         Qt.WindowType.Tool | Qt.WindowType.WindowTransparentForInput)
+                         Qt.WindowType.Tool | Qt.WindowType.WindowDoesNotAcceptFocus)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
-        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
-        geometry = screen.geometry()
-        self.setGeometry(geometry.x() + region.x() - 5, geometry.y() + region.y() - 5,
-                         region.width() + 10, region.height() + 10)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setMouseTracking(True)
+        self.screen_ref = screen
+        self.region = QRect(region)
+        self.drag_part = None
+        self.drag_origin = QPoint()
+        self.drag_region = QRect()
+        self.capture_excluded = False
+        self.update_geometry()
+
+    def update_geometry(self):
+        geometry = self.screen_ref.geometry()
+        margin = self.MARGIN
+        self.setGeometry(geometry.x() + self.region.x() - margin,
+                         geometry.y() + self.region.y() - margin,
+                         self.region.width() + margin * 2, self.region.height() + margin * 2)
+        inner = QRect(margin + 4, margin + 4, self.region.width() - 8, self.region.height() - 8)
+        self.setMask(QRegion(self.rect()).subtracted(QRegion(inner)))
+        self.update()
+
+    def hit_part(self, point: QPoint) -> str:
+        left, right = point.x() < self.HIT, point.x() >= self.width() - self.HIT
+        top, bottom = point.y() < self.HIT, point.y() >= self.height() - self.HIT
+        if top and left: return "top_left"
+        if top and right: return "top_right"
+        if bottom and left: return "bottom_left"
+        if bottom and right: return "bottom_right"
+        if top and abs(point.x() - self.width() // 2) <= 25: return "move"
+        if top: return "top"
+        if bottom: return "bottom"
+        if left: return "left"
+        if right: return "right"
+        return "move"
+
+    def set_part_cursor(self, part: str):
+        cursors = {"top_left": Qt.CursorShape.SizeFDiagCursor, "bottom_right": Qt.CursorShape.SizeFDiagCursor,
+                   "top_right": Qt.CursorShape.SizeBDiagCursor, "bottom_left": Qt.CursorShape.SizeBDiagCursor,
+                   "top": Qt.CursorShape.SizeVerCursor, "bottom": Qt.CursorShape.SizeVerCursor,
+                   "left": Qt.CursorShape.SizeHorCursor, "right": Qt.CursorShape.SizeHorCursor,
+                   "move": Qt.CursorShape.SizeAllCursor}
+        self.setCursor(cursors[part])
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.drag_part = self.hit_part(event.position().toPoint())
+            self.drag_origin = event.globalPosition().toPoint()
+            self.drag_region = QRect(self.region)
+            self.set_part_cursor(self.drag_part)
+            self.interaction_started.emit()
+
+    def mouseMoveEvent(self, event):
+        if self.drag_part is None:
+            self.set_part_cursor(self.hit_part(event.position().toPoint()))
+            return
+        delta = event.globalPosition().toPoint() - self.drag_origin
+        rect = QRect(self.drag_region)
+        bounds = self.screen_ref.geometry()
+        max_x, max_y = bounds.width() - 1, bounds.height() - 1
+        if self.drag_part == "move":
+            x = max(0, min(rect.x() + delta.x(), max_x - rect.width() + 1))
+            y = max(0, min(rect.y() + delta.y(), max_y - rect.height() + 1))
+            rect.moveTo(x, y)
+        else:
+            if "left" in self.drag_part:
+                rect.setLeft(max(0, min(rect.left() + delta.x(), rect.right() - self.MIN_SIZE + 1)))
+            if "right" in self.drag_part:
+                rect.setRight(min(max_x, max(rect.right() + delta.x(), rect.left() + self.MIN_SIZE - 1)))
+            if "top" in self.drag_part:
+                rect.setTop(max(0, min(rect.top() + delta.y(), rect.bottom() - self.MIN_SIZE + 1)))
+            if "bottom" in self.drag_part:
+                rect.setBottom(min(max_y, max(rect.bottom() + delta.y(), rect.top() + self.MIN_SIZE - 1)))
+        self.region = rect
+        self.update_geometry()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self.drag_part is not None:
+            self.drag_part = None
+            self.interaction_finished.emit(QRect(self.region), self.region != self.drag_region)
 
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
         painter.setPen(QPen(QColor("#246aee"), 2))
-        painter.drawRoundedRect(self.rect().adjusted(1, 1, -2, -2), 7, 7)
+        rect = QRect(self.MARGIN, self.MARGIN, self.region.width(), self.region.height())
+        painter.drawRect(rect.adjusted(0, 0, -1, -1))
+        painter.setBrush(QColor("white"))
+        for point in (rect.topLeft(), rect.topRight(), rect.bottomLeft(), rect.bottomRight(),
+                      QPoint(rect.center().x(), rect.top()), QPoint(rect.center().x(), rect.bottom()),
+                      QPoint(rect.left(), rect.center().y()), QPoint(rect.right(), rect.center().y())):
+            painter.drawEllipse(point, 4, 4)
+        painter.setPen(QPen(QColor("#246aee"), 4, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        painter.drawLine(rect.center().x() - 15, rect.top() - 5, rect.center().x() + 15, rect.top() - 5)
 
     def showEvent(self, event):
         super().showEvent(event)
-        exclude_window_from_capture(int(self.winId()))
+        self.capture_excluded = exclude_window_from_capture(int(self.winId()))
 
 
 class ThemeComboBox(QComboBox):
@@ -203,6 +291,10 @@ class SettingsDialog(QDialog):
         self.theme_input.setCurrentIndex(self.theme_input.findData(parent.theme_mode))
         layout.addWidget(self.theme_input)
 
+        self.bring_to_front_input = QCheckBox("选区完成后将主窗口显示在最前")
+        self.bring_to_front_input.setChecked(parent.bring_to_front_after_capture)
+        layout.addWidget(self.bring_to_front_input)
+
         row = QHBoxLayout()
         row.addStretch()
         cancel = QPushButton("取消")
@@ -222,6 +314,7 @@ class SettingsDialog(QDialog):
                 save_api_key(self.key_input.text())
             self.parent().bind_shortcut(sequence, persist=True, strict=True)
             self.parent().set_theme_mode(self.theme_input.currentData())
+            self.parent().set_bring_to_front(self.bring_to_front_input.isChecked())
         except Exception as exc:
             QMessageBox.warning(self, "保存失败", str(exc))
             return
@@ -338,10 +431,13 @@ class MainWindow(QMainWindow):
         self.single_shot_active = False
         self.capture_excluded = False
         self.capture_in_progress = False
+        self.previous_foreground = None
         self.hotkey_sequence = load_shortcut()
         self.hotkey_registered = False
         self.hotkey_initialized = False
         self.shortcut_editing = False
+        self.bring_to_front_after_capture = QSettings("Snap Solve", "Snap Solve").value(
+            "bring_to_front_after_capture", False, type=bool)
         self.region_screen = None
         self.region_rect: QRect | None = None
         self.region_frame: RegionFrame | None = None
@@ -398,7 +494,7 @@ class MainWindow(QMainWindow):
         self.solve_toggle.toggled.connect(self.on_solve_toggled)
         action_row.addWidget(self.solve_toggle)
         action_row.addStretch()
-        hint = QLabel("持续监测：稳定后更新  ·  单次模式：选完即读")
+        hint = QLabel("拖动边框调整选区  ·  顶部短横可移动")
         hint.setObjectName("muted")
         action_row.addWidget(hint)
         body.addLayout(action_row)
@@ -422,6 +518,10 @@ class MainWindow(QMainWindow):
         save_theme_mode(mode)
         self.theme_mode = mode
         self.apply_theme()
+
+    def set_bring_to_front(self, enabled: bool) -> None:
+        self.bring_to_front_after_capture = enabled
+        QSettings("Snap Solve", "Snap Solve").setValue("bring_to_front_after_capture", enabled)
 
     def on_system_color_scheme_changed(self, _scheme) -> None:
         if self.theme_mode == "system":
@@ -483,6 +583,7 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(250, self.show_overlays)
 
     def show_overlays(self):
+        self.previous_foreground = foreground_window()
         self.overlays = []
         for screen in QApplication.screens():
             overlay = CaptureOverlay(screen)
@@ -495,14 +596,23 @@ class MainWindow(QMainWindow):
         if self.overlays:
             self.overlays[0].activateWindow()
 
-    def dismiss_overlays(self):
+    def dismiss_overlays(self, *, bring_to_front: bool = False):
         for overlay in self.overlays:
             overlay.close()
             overlay.deleteLater()
         self.overlays = []
         self.capture_in_progress = False
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, not bring_to_front)
         self.show()
-        self.activateWindow()
+        if bring_to_front:
+            self.raise_()
+            self.activateWindow()
+        else:
+            self.lower()
+            previous = self.previous_foreground
+            if previous and previous != int(self.winId()):
+                QTimer.singleShot(0, lambda: restore_foreground(previous))
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, False)
 
     def cancel_capture(self):
         self.dismiss_overlays()
@@ -512,13 +622,15 @@ class MainWindow(QMainWindow):
                 self.region_frame.show()
             self.status.setText("已取消重新选区，继续监测原区域")
         else:
+            if self.region_frame:
+                self.region_frame.show()
             self.status.setText("已取消选择区域")
 
     def capture_selected(self, pixmap: QPixmap):
         overlay = self.sender()
         screen = overlay.screen if isinstance(overlay, CaptureOverlay) else None
         region = overlay.selection_rect() if isinstance(overlay, CaptureOverlay) else QRect()
-        self.dismiss_overlays()
+        self.dismiss_overlays(bring_to_front=self.bring_to_front_after_capture)
         if pixmap.isNull() or screen is None or region.isEmpty():
             self.status.setText("截图失败，请重试")
             return
@@ -532,25 +644,62 @@ class MainWindow(QMainWindow):
             self.worker.cancel_requested = True
         self.question_card.editor.clear()
         self.solution_card.editor.clear()
+        self.region_screen = screen
+        self.region_rect = region
+        self.region_frame = RegionFrame(screen, region)
+        self.region_frame.interaction_started.connect(self.on_region_interaction_started)
+        self.region_frame.interaction_finished.connect(self.on_region_interaction_finished)
+        if not self.capture_excluded:
+            self.move_away_from_region()
+        self.region_frame.show()
         if self.monitor_toggle.isChecked():
             self.single_shot_active = False
             self.pending_single_pixmap = None
-            self.region_screen = screen
-            self.region_rect = region
-            self.region_frame = RegionFrame(screen, region)
-            if not self.capture_excluded:
-                self.move_away_from_region()
             self.last_signature = image_signature(pixmap)
             self.processed_signature = None
             self.last_changed_at = time.monotonic()
-            self.region_frame.show()
             self.monitor_timer.start()
-            self.status.setText("监测中 · 等待画面稳定…")
+            self.status.setText("监测中 · 拖动边框可调整选区")
         else:
-            self.region_screen = None
-            self.region_rect = None
             self.last_signature = None
             self.processed_signature = None
+            self.single_shot_active = True
+            self.pending_single_pixmap = pixmap
+            self.start_pending_single_shot()
+
+    def on_region_interaction_started(self):
+        self.monitor_timer.stop()
+        self.status.setText("正在调整选区…")
+
+    def on_region_interaction_finished(self, region: QRect, changed: bool):
+        self.region_rect = region
+        if not changed:
+            if self.monitor_toggle.isChecked():
+                self.monitor_timer.start()
+                self.status.setText("监测中 · 拖动边框可调整选区")
+            else:
+                self.status.setText("单次模式 · 拖动边框可调整选区")
+            return
+        self.generation += 1
+        self.pending_single_pixmap = None
+        self.processed_signature = None
+        if self.worker:
+            self.worker.cancel_requested = True
+        if not self.capture_excluded:
+            self.move_away_from_region()
+        pixmap = self.capture_region()
+        if pixmap.isNull():
+            self.status.setText("无法读取区域，请重新选择屏幕")
+            return
+        self.candidate_pixmap = pixmap
+        if self.monitor_toggle.isChecked():
+            self.single_shot_active = False
+            self.last_signature = image_signature(pixmap)
+            self.processed_signature = None
+            self.last_changed_at = time.monotonic()
+            self.monitor_timer.start()
+            self.status.setText("选区已调整 · 等待画面稳定…")
+        else:
             self.single_shot_active = True
             self.pending_single_pixmap = pixmap
             self.start_pending_single_shot()
@@ -608,9 +757,7 @@ class MainWindow(QMainWindow):
         self.pending_single_pixmap = None
         if not enabled:
             self.monitor_timer.stop()
-            if self.region_frame:
-                self.region_frame.hide()
-            self.status.setText("单次模式 · 点击「选择屏幕区域」后立即识别一次")
+            self.status.setText("单次模式 · 选取或调整选区后识别一次")
             return
         if not self.region_rect:
             self.status.setText("监测已开启 · 请先选择屏幕区域")
@@ -642,7 +789,16 @@ class MainWindow(QMainWindow):
         if self.region_screen not in QApplication.screens():
             return QPixmap()
         rect = self.region_rect
-        return self.region_screen.grabWindow(0, rect.x(), rect.y(), rect.width(), rect.height())
+        frame = self.region_frame
+        hidden = frame is not None and frame.isVisible() and not frame.capture_excluded
+        if hidden:
+            frame.hide()
+            QApplication.processEvents()
+        try:
+            return self.region_screen.grabWindow(0, rect.x(), rect.y(), rect.width(), rect.height())
+        finally:
+            if hidden:
+                frame.show()
 
     def poll_region(self):
         if not self.monitor_toggle.isChecked() or self.region_rect is None:

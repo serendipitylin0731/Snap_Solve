@@ -11,14 +11,14 @@ from urllib.error import HTTPError
 os.environ.setdefault("QT_QPA_PLATFORM", "windows" if sys.platform == "win32" else "offscreen")
 
 from PySide6.QtWidgets import QApplication, QLabel, QWidget
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QPoint, QRect, Qt
 from PySide6.QtGui import QColor, QKeySequence, QPixmap
 from PySide6.QtTest import QTest
 
 from snap_solve import deepseek
 from snap_solve.hotkey import HOTKEY_ID, WM_HOTKEY, MOD_ALT, MOD_CONTROL, windows_hotkey
 from snap_solve.monitor import image_signature
-from snap_solve.ui import MainWindow, SettingsDialog
+from snap_solve.ui import MainWindow, RegionFrame, SettingsDialog
 
 
 class DeepSeekTests(unittest.TestCase):
@@ -127,6 +127,44 @@ class UiTests(unittest.TestCase):
             self.assertEqual(saved.call_count, 2)
         window.close()
 
+    def test_bring_to_front_setting_and_capture_completion(self):
+        window = MainWindow()
+        window.bring_to_front_after_capture = False
+        with patch("snap_solve.ui.get_api_key", return_value=""), \
+             patch("snap_solve.ui.QSettings") as settings, \
+             patch.object(window, "bind_shortcut"), patch.object(window, "set_theme_mode"):
+            dialog = SettingsDialog(window)
+            self.assertFalse(dialog.bring_to_front_input.isChecked())
+            dialog.bring_to_front_input.setChecked(True)
+            dialog.save()
+            settings.return_value.setValue.assert_called_with("bring_to_front_after_capture", True)
+            self.assertTrue(window.bring_to_front_after_capture)
+        with patch.object(window, "raise_") as raise_window, \
+             patch.object(window, "activateWindow") as activate_window:
+            window.dismiss_overlays(bring_to_front=False)
+            raise_window.assert_not_called()
+            activate_window.assert_not_called()
+            window.dismiss_overlays(bring_to_front=True)
+            raise_window.assert_called_once()
+            activate_window.assert_called_once()
+        window.close()
+
+    def test_region_frame_resizes_and_moves(self):
+        frame = RegionFrame(self.app.primaryScreen(), QRect(100, 100, 200, 140))
+        frame.show()
+        top_left = QPoint(frame.MARGIN, frame.MARGIN)
+        QTest.mousePress(frame, Qt.MouseButton.LeftButton, pos=top_left)
+        QTest.mouseMove(frame, top_left - QPoint(20, 15), delay=50)
+        QTest.mouseRelease(frame, Qt.MouseButton.LeftButton, pos=top_left)
+        self.assertEqual(frame.region, QRect(80, 85, 220, 155))
+
+        handle = QPoint(frame.width() // 2, frame.MARGIN - 5)
+        QTest.mousePress(frame, Qt.MouseButton.LeftButton, pos=handle)
+        QTest.mouseMove(frame, handle + QPoint(30, 20), delay=50)
+        QTest.mouseRelease(frame, Qt.MouseButton.LeftButton, pos=handle)
+        self.assertEqual(frame.region, QRect(110, 105, 220, 155))
+        frame.close()
+
     def test_shortcut_validation_and_custom_binding(self):
         self.assertEqual(windows_hotkey(QKeySequence("Ctrl+Alt+S")),
                          (MOD_ALT | MOD_CONTROL | 0x4000, ord("S")))
@@ -159,8 +197,10 @@ class UiTests(unittest.TestCase):
         window = MainWindow()
         window.show()
         window.solve_toggle.setChecked(True)
+        requests = []
 
         def fake_transcribe(key, image, update, cancelled):
+            requests.append(image)
             update("# 测试题")
             return "# 测试题"
 
@@ -191,10 +231,32 @@ class UiTests(unittest.TestCase):
             self.assertEqual(window.solution_card.editor.toPlainText(), "## 解答")
             self.assertTrue(window.solution_card.isVisible())
             self.assertTrue(window.monitor_timer.isActive())
+
+            frame = window.region_frame
+            self.assertFalse(frame.mask().contains(frame.rect().center()))
+            self.assertTrue(frame.mask().contains(QPoint(frame.MARGIN, frame.MARGIN)))
+            corner = QPoint(frame.width() - frame.MARGIN, frame.height() - frame.MARGIN)
+            old_width = window.region_rect.width()
+            QTest.mousePress(frame, Qt.MouseButton.LeftButton, pos=corner)
+            self.assertFalse(window.monitor_timer.isActive())
+            QTest.mouseMove(frame, corner + QPoint(30, 20), delay=50)
+            QTest.mouseRelease(frame, Qt.MouseButton.LeftButton, pos=corner + QPoint(30, 20))
+            self.assertEqual(window.region_rect.width(), old_width + 30)
+            self.assertTrue(window.monitor_timer.isActive())
+            window.poll_region()
+            self.assertEqual(len(requests), 1)
+            window.last_changed_at = time.monotonic() - 2
+            window.poll_region()
+            for _ in range(30):
+                QTest.qWait(100)
+                if len(requests) == 2 and window.worker is None:
+                    break
+            self.assertEqual(len(requests), 2)
             window.solve_toggle.setChecked(False)
             self.assertFalse(window.solution_card.isVisible())
             window.monitor_toggle.setChecked(False)
             self.assertFalse(window.monitor_timer.isActive())
+            self.assertTrue(frame.isVisible())
         window.close()
 
     def test_retranscribes_only_after_new_stable_image(self):
@@ -238,7 +300,7 @@ class UiTests(unittest.TestCase):
             self.assertEqual(window.question_card.editor.toPlainText(), "# 第 2 题")
         window.close()
 
-    def test_single_shot_mode_runs_once_without_region(self):
+    def test_single_shot_mode_keeps_adjustable_region(self):
         window = MainWindow()
         window.show()
         window.monitor_toggle.setChecked(False)
@@ -270,10 +332,27 @@ class UiTests(unittest.TestCase):
             self.assertEqual(window.question_card.editor.toPlainText(), "# 单次题目 1")
             self.assertEqual(len(requests), 1)
             self.assertFalse(window.monitor_timer.isActive())
-            self.assertIsNone(window.region_rect)
-            self.assertIsNone(window.region_frame)
+            self.assertIsNotNone(window.region_rect)
+            self.assertTrue(window.region_frame.isVisible())
             QTest.qWait(800)
             self.assertEqual(len(requests), 1)
+
+            frame = window.region_frame
+            original_region = window.region_rect
+            corner = QPoint(frame.width() - frame.MARGIN, frame.height() - frame.MARGIN)
+            QTest.mousePress(frame, Qt.MouseButton.LeftButton, pos=corner)
+            QTest.mouseMove(frame, corner + QPoint(35, 25), delay=50)
+            QTest.mouseRelease(frame, Qt.MouseButton.LeftButton, pos=corner + QPoint(35, 25))
+            for _ in range(30):
+                QTest.qWait(100)
+                if len(requests) == 2 and window.worker is None:
+                    break
+            self.assertEqual(window.region_rect.width(), original_region.width() + 35)
+            self.assertEqual(window.region_rect.height(), original_region.height() + 25)
+            self.assertEqual(len(requests), 2)
+            self.assertFalse(window.monitor_timer.isActive())
+            self.assertTrue(frame.isVisible())
+
             window.solve_toggle.setChecked(True)
             window.start_capture()
             QTest.qWait(400)
@@ -283,11 +362,11 @@ class UiTests(unittest.TestCase):
             QTest.mouseRelease(overlay, Qt.MouseButton.LeftButton, pos=QPoint(270, 190))
             for _ in range(30):
                 QTest.qWait(100)
-                if len(requests) == 2 and window.worker is None:
+                if len(requests) == 3 and window.worker is None:
                     break
-            self.assertEqual(window.question_card.editor.toPlainText(), "# 单次题目 2")
+            self.assertEqual(window.question_card.editor.toPlainText(), "# 单次题目 3")
             self.assertEqual(window.solution_card.editor.toPlainText(), "## 单次题解")
-            self.assertEqual(len(requests), 2)
+            self.assertEqual(len(requests), 3)
         window.close()
 
     @unittest.skipUnless(sys.platform == "win32" and sys.getwindowsversion().build >= 19041,
